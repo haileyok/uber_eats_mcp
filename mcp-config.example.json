@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "uber-eats": {
+      "command": "uv",
+      "args": ["run", "--directory", "/absolute/path/to/uber-eats-mcp", "uber-eats-mcp"]
+    }
+  }
+}

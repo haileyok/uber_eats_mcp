@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Environment variables / credentials
+.env
+.env.*
+.env.local
+
+# Uber Eats session & config (contains auth tokens)
+.ubereats-session.json
+.ubereats-config.json
+.ubereats-api-log.jsonl
+.ubereats-preferences.json
+
+# uv
+# Commit uv.lock for reproducible installs
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# MCP config (contains local paths)
+.mcp.json
+
+# Logs
+*.log
+
+# Test / coverage
+.coverage
+htmlcov/
+.pytest_cache/

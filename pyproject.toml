@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uber-eats-mcp"
+version = "0.1.0"
+description = "MCP server for ordering food on Uber Eats"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp[cli]>=1.26.0",
+    "playwright>=1.58.0",
+    "httpx>=0.28.0",
+]
+
+[project.scripts]
+uber-eats-mcp = "server:main"
+
+[tool.setuptools]
+py-modules = ["server", "api", "ubereats", "browser", "preferences", "recommender"]
