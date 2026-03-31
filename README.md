@@ -1,6 +1,6 @@
-# Uber Eats MCP Server
+# Claude, I’m hungry. 🍜
 
-Order food from Uber Eats through natural language in **Cursor** or **Claude Code**.
+Order food from Uber Eats through natural language in **Cursor** or **Claude Code** — with an assistant that can browse menus, prep checkout, and (when you say so) place the order.
 
 This project is an [**MCP server**](https://modelcontextprotocol.io/) (Model Context Protocol): a small program your AI client starts over **stdio** so it can call tools like `uber_eats_search` and `uber_eats_checkout_preview`.  
 It is **not** a Cursor extension / VS Code plugin.
