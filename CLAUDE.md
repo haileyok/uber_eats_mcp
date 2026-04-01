@@ -8,6 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with th
 
 This server is designed to be used **from Claude Code** or **Cursor** as the primary interface for ordering food without leaving your editor.
 
+**Implementation note:** Cart add/remove and item customizations use the same JSON APIs as the Uber Eats website (`addItemsToDraftOrderV2`, `getMenuItemV1`, etc.). Playwright is reserved for login and placing the order until a submit API is integrated.
+
 ## Quick Start
 
 ```bash
@@ -20,13 +22,13 @@ Then use the MCP tools directly from Claude Code or Cursor.
 
 ## MCP Server
 
-The server exposes **13 tools** for Claude to call natively:
+The server exposes **34 tools** for Claude to call natively:
 
 ### Authentication
 | Tool | Description |
 |------|-------------|
 | `uber_eats_login` | Opens Chromium browser for manual login. Captures auth tokens from network traffic. Session saved for reuse — only login once. |
-| `uber_eats_whoami` | Shows logged-in user info: name, email, address, session status. |
+| `uber_eats_whoami` | Shows logged-in user info: name, email, address, preferences. |
 
 ### Delivery Address
 | Tool | Description |
@@ -96,8 +98,10 @@ User: "I want to order a pizza"
 
 ```
 uber-eats-mcp/
-  server.py            → MCP server entry point (13 tools via FastMCP)
-  ubereats.py          → Page interaction logic (Playwright automation)
+  server.py            → MCP server entry point (tools via FastMCP)
+  api.py               → Authenticated HTTP client for /_p/api/* and related
+  cart_api.py          → Cart payload helpers (add/remove line items)
+  ubereats.py          → Tool implementations (API-first; Playwright for login / place_order)
   browser.py           → Browser lifecycle, session persistence, token capture
   pyproject.toml       → Dependencies (mcp, playwright)
   CLAUDE.md            → This file (agent guide)
@@ -149,20 +153,19 @@ When using this as an agent (from Claude Code or Cursor), follow these rules:
 - **Config/tokens**: Saved to `~/.ubereats-config.json` (captured auth tokens, user info)
 - Sessions persist across restarts — login once, reuse forever (until session expires)
 - If tools return auth errors, re-run `uber_eats_login`
+- **Login debug trace**: each `uber_eats_login` run (when `UBEREATS_BROWSER_DEBUG` is not `0`) overwrites `~/.ubereats-login-debug.jsonl` with JSON lines: URL, `has_auth_signals`, Uber cookie **names** (not values), sign-in link counts, `save_session` outcome. The tool response may include `debug_log` with the file path. Disable with `UBEREATS_BROWSER_DEBUG=0`.
 
 ## How It Works
 
-The server uses **Playwright browser automation** to interact with ubereats.com:
-
 1. **Login**: Opens a real Chromium window. User logs in manually. The server intercepts network traffic to capture auth tokens, cookies, CSRF tokens, and user info.
-2. **Browsing**: Navigates to pages, waits for dynamic content to render, extracts structured data from the DOM.
-3. **Cart/Order**: Clicks buttons, fills forms, reads confirmations — all through Playwright's reliable selectors.
+2. **Browse / cart / checkout**: Uses `httpx` against Uber’s `/_p/api/*` endpoints (same session cookies as the browser).
+3. **Place order**: Still uses Playwright to click through checkout until a submit API is implemented.
 4. **Session persistence**: Browser state (cookies/storage) is saved to disk so the user only logs in once.
 
 ## Important Notes
 
-- **Browser required**: Playwright needs Chromium installed (`uv run playwright install chromium`).
-- **Headed mode**: Login and place_order open a visible browser window. Other operations run headless.
+- **Browser required for login / place order**: Playwright needs Chromium installed (`uv run playwright install chromium`).
+- **Headed mode**: Login, `set_address`, cart/checkout browser fallbacks, and `place_order` use the same headed Chromium + network interception stack as API discovery (`ensure_interactive_page` in `browser.py`), including the same default window size (1280×900). To use a smaller window, set `UBEREATS_BROWSER_VIEWPORT=1100x800` (or similar) in the MCP server env. Most other tools use HTTP only.
 - **Session expiry**: Uber Eats sessions expire periodically. Re-run login when you get auth errors.
 - **DOM changes**: Uber Eats may update their website. If selectors break, update `ubereats.py`.
 - **Rate limiting**: Don't call tools too rapidly. The server includes reasonable waits between actions.

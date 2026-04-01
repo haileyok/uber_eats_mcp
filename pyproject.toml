@@ -14,8 +14,11 @@ dependencies = [
     "httpx>=0.28.0",
 ]
 
-[project.scripts]
-uber-eats-mcp = "server:main"
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0"]
 
-[tool.setuptools]
-py-modules = ["server", "api", "ubereats", "browser", "preferences", "recommender"]
+[project.scripts]
+uber-eats-mcp = "uber_eats_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

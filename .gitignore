@@ -21,7 +21,12 @@ ENV/
 # Uber Eats session & config (contains auth tokens)
 .ubereats-session.json
 .ubereats-config.json
+.ubereats-session.json.prelogin.bak
+.ubereats-config.json.prelogin.bak
 .ubereats-api-log.jsonl
+.ubereats-mcp-login-trace.jsonl
+.ubereats-login-debug.jsonl
+.ubereats-cart-debug.jsonl
 .ubereats-preferences.json
 
 # uv

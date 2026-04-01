@@ -3,8 +3,8 @@
 Uber Eats MCP Server
 ~~~~~~~~~~~~~~~~~~~~
 Exposes tools for ordering food on Uber Eats.
-Uses direct API calls for browsing, cart, checkout prep (fast); browser for login,
-add-to-cart, item options, address picker, and place_order until submit API exists.
+Uses direct API calls for browsing, cart mutations, checkout prep, and item options;
+browser for login, optional address picker, and place_order fallback when API submit fails.
 
 Run directly:  python server.py
 Or via MCP:    configured in .cursor/mcp.json or .mcp.json
@@ -13,27 +13,48 @@ Or via MCP:    configured in .cursor/mcp.json or .mcp.json
 from __future__ import annotations
 
 import json
-import sys
 import os
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import sys
 
 from mcp.server.fastmcp import FastMCP
 
-import ubereats
-import preferences
-import recommender
-from browser import manager
+from . import terminal_art
+from . import ubereats
+from . import preferences
+from . import recommender
+from .browser import manager
 
 mcp = FastMCP(
     "uber-eats",
     instructions="\n".join([
         "Uber Eats assistant. Order food and groceries from Uber Eats.",
         "",
-        "Order flow: login → load preferences → confirm address → search → get_restaurant_menu → get_item_options (if customizable) → add_to_cart → view_cart → checkout_preview → confirm with user → place_order → track_orders",
-        "Cart and checkout previews use the Uber API when logged in (fast). Browser fallback only if the API fails.",
+        "VOICE (critical): When you speak to the human, sound like a friend helping them order—warm, short, no jargon.",
+        "Never say: API, MCP, endpoint, JSON, session, CSRF, payload, 'returned by the system', or similar.",
+        "Paraphrase tool results in plain language (e.g. empty payment_methods → 'You’ll pick a card when we check out—that’s normal').",
+        "If a JSON field is named assistant_hint, fix_for_assistant, or debug_*, use it for your reasoning only—do not quote it to the user.",
         "",
-        "PERSONALIZATION: On first interaction each session:",
+        "Order flow (happy path, fewest steps): probe session → confirm address → search (product name) OR pick a store → get_item_options only if the item has required choices → add_to_cart → view_cart → checkout_preview → payment + tip → explicit confirm → place_order → track_orders.",
+        "Cart mutations use the Uber JSON API (add/remove/update quantity). Checkout preview surfaces real totals, fees, and promos (strikethrough prices, Uber One, banners)—that is where the user sees final pricing, not only at add time.",
+        "When the user asks to change how many of something: call uber_eats_view_cart if needed, then uber_eats_update_cart_quantity with shopping_cart_item_uuid from items[] (best) or item_name.",
+        "OFFERS: If search items[], menu rows, cart lines, or checkout items include on_offer, offer_summary, offer_badge, regular_price vs line_price, or strikethrough pricing—say the deal in plain language (e.g. on sale, was X, now Y, or the badge text). Do not skip mentioning a visible promotion.",
+        "",
+        "LOGIN LAST (critical):",
+        "  Never call uber_eats_login as the first tool. It opens a browser window and often fails if another login runs in parallel.",
+        "  Start with uber_eats_get_preferences, then uber_eats_get_address (and uber_eats_whoami if you need account clarity)—they use saved session files and do NOT open the login browser.",
+        "  Call uber_eats_login only when a tool returns a clear not-signed-in / session / auth error, or the user explicitly asks to sign in.",
+        "  uber_eats_login(force=false) skips the browser if the saved session already passes Uber’s API—use force=true only to re-authenticate or switch accounts.",
+        "",
+        "SEARCH BEFORE FULL MENU (critical):",
+        "  If the user names a specific product (e.g. Red Bull, milk, diapers) or the store is a supermarket / grocery / Jumbo / Líder / large market: call uber_eats_search with that product query FIRST.",
+        "  Do NOT call uber_eats_restaurant_menu for the entire store in that case—grocery menus can be 100k+ characters and exceed the client tool-result token limit.",
+        "  Prefer: uber_eats_search → uber_eats_add_to_cart with store_uuid + menu_item_uuid (section_uuid must not equal store_uuid—if unsure, omit section and the server resolves from the menu).",
+        "  After search hits, avoid re-loading the whole grocery menu unless the user wants to browse categories.",
+        "  Use uber_eats_restaurant_menu mainly for smaller restaurants when a full menu browse is reasonable.",
+        "",
+        "If any tool result JSON contains an \"error\" key or clear failure, do NOT tell the user the action succeeded—fix session (login) or retry.",
+        "",
+        "PERSONALIZATION: On first interaction each session (before login unless the user asked to sign in):",
         "  1. Call uber_eats_get_preferences to load user defaults",
         "  2. If a default_address is set, switch to it automatically (no need to ask)",
         "  3. If the user seems undecided, offer: 'Want me to suggest something based on your mood?'",
@@ -63,13 +84,13 @@ mcp = FastMCP(
         "  Step 5: Optionally use uber_eats_set_checkout_tip / uber_eats_set_checkout_payment with draft_order_uuid from checkout_preview.",
         "  Step 6: After payment and tip are decided, show the FINAL summary with the grand total (including tip).",
         "  Step 7: Ask: 'Should I place the order?' and WAIT for explicit confirmation.",
-        "  Step 8: ONLY after the user explicitly confirms, call place_order (browser until submit API is implemented).",
+        "  Step 8: ONLY after the user explicitly confirms, call place_order (API submit first; browser fallback if needed).",
         "",
         "  NEVER call place_order without completing the confirmation steps above.",
         "  NEVER call place_order in the same turn as checkout_preview.",
         "  If the user says 'cancel', 'no', 'wait', or anything other than clear confirmation, do NOT place the order.",
         "",
-        "IMPORTANT: If a tool returns an error about not being logged in, call uber_eats_login first.",
+        "IMPORTANT: If a tool returns an error about not being logged in after session probe, call uber_eats_login (single login at a time).",
     ]),
 )
 
@@ -77,22 +98,25 @@ mcp = FastMCP(
 # ── Auth ─────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-async def uber_eats_login() -> str:
+async def uber_eats_login(force: bool = False) -> str:
     """
-    Open a visible browser window so the user can log in to Uber Eats.
-    Captures auth tokens and session data from network traffic.
-    Session is saved for reuse — only need to login once.
-    Call this before any other tool if the user is not yet logged in.
+    Open a visible browser window so the user can sign in to Uber Eats.
+    By default, if ~/.ubereats-session.json already works for Uber’s API, returns success
+    without opening a window (avoids wiping/restoring session by mistake).
+
+    Args:
+        force: If true, always run the full login flow (clears saved session first). Use to
+            switch accounts or recover from a bad cookie file.
     """
-    result = await ubereats.login()
+    result = await ubereats.login(force=force)
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
 @mcp.tool()
 async def uber_eats_whoami() -> str:
     """
-    Get current user profile info and login status.
-    Shows name, email, delivery address, and session info.
+    Get current user profile info and login status from saved session (no login browser).
+    Use with get_preferences/get_address before deciding whether uber_eats_login is needed.
     """
     result = await ubereats.whoami()
     return json.dumps(result, indent=2, ensure_ascii=False)
@@ -127,7 +151,8 @@ async def uber_eats_switch_address(label: str) -> str:
 @mcp.tool()
 async def uber_eats_get_address() -> str:
     """
-    Get the current delivery address. Use this to verify where food will be delivered.
+    Current delivery address from saved session/config (no login browser).
+    Prefer this (with get_preferences) before uber_eats_login when starting a chat.
     """
     result = await ubereats.get_addresses()
     return json.dumps(result, indent=2, ensure_ascii=False)
@@ -151,12 +176,17 @@ async def uber_eats_set_address(address: str) -> str:
 @mcp.tool()
 async def uber_eats_search(query: str) -> str:
     """
-    Search Uber Eats for restaurants matching the query.
-    Returns restaurants with name, URL, rating, ETA, and open/closed status.
-    Use the UUID or URL in subsequent calls to get_restaurant_menu.
+    Global Uber Eats search (same flow as the web search bar: getSearchFeedV1, merged
+    with getFeedV1 for extra catalog rows). Response JSON has:
+    - stores: list of merchants (name, uuid, url, eta, …)
+    - items: catalog hits (menu_item_uuid, section_uuid, subsection_uuid, store_uuid)
+      for product-style queries like energy drinks or grocery SKUs
+    - feed_item_types: raw feed module types (debugging)
+
+    Use items[] for quick add via menu_item_detail / add_to_cart; use stores[] for browsing.
 
     Args:
-        query: What to search for (e.g. 'sushi', 'pizza', 'burgers')
+        query: Search text (cuisine, store, or product, e.g. 'sushi', 'red bull')
     """
     results = await ubereats.search_restaurants(query)
     return json.dumps(results, indent=2, ensure_ascii=False)
@@ -179,8 +209,9 @@ async def uber_eats_nearby_restaurants(limit: int = 15) -> str:
 @mcp.tool()
 async def uber_eats_restaurant_menu(restaurant_url: str) -> str:
     """
-    Get the full menu for a restaurant. Pass the URL or slug from search results.
-    Returns categorized menu items with names, prices, and descriptions.
+    Full menu for one store. OK for small restaurants; for supermarkets/groceries
+    the payload can be enormous (100k+ chars) and exceed the client's tool limit—
+    prefer uber_eats_search with the product name first, then item-level tools.
 
     Args:
         restaurant_url: Full URL (https://www.ubereats.com/store/...) or restaurant slug
@@ -193,6 +224,7 @@ async def uber_eats_restaurant_menu(restaurant_url: str) -> str:
 async def uber_eats_get_item_options(item_name: str, restaurant_url: str = "") -> str:
     """
     Get customization options for a menu item (sizes, extras, required choices).
+    Each group includes required, min_permitted, max_permitted, pick_one (when API provides them).
     Call this before add_to_cart if the item has options/modifiers.
 
     Args:
@@ -207,24 +239,44 @@ async def uber_eats_get_item_options(item_name: str, restaurant_url: str = "") -
 
 @mcp.tool()
 async def uber_eats_add_to_cart(
-    item_name: str,
+    item_name: str = "",
     quantity: int = 1,
     restaurant_url: str = "",
+    store_uuid: str = "",
+    section_uuid: str = "",
+    subsection_uuid: str = "",
+    menu_item_uuid: str = "",
 ) -> str:
     """
-    Add a menu item to the cart. The browser must be on a restaurant page
-    (or provide restaurant_url). If the item has required customizations,
-    call uber_eats_get_item_options first.
+    Add a line via addItemsToDraftOrderV2 + getMenuItemV1 (same stack for restaurants and grocery).
+
+    Best: pass store_uuid + menu_item_uuid (required). The server loads getStoreV1 and resolves the
+    real section_uuid / subsection_uuid from the menu—so wrong search data (e.g. section_uuid =
+    store_uuid) is fixed automatically when the SKU exists in the menu.
+
+    Optional: section_uuid, subsection_uuid, item_name from uber_eats_search items[] or restaurant_menu.
+
+    Fallback: restaurant_url + item_name (fuzzy match on full menu; more error-prone).
+
+    If the item has required customizations, call uber_eats_get_item_options first.
 
     Args:
-        item_name: Name of the menu item to add
+        item_name: Display / fuzzy name (optional if UUID path fills title from getMenuItemV1)
         quantity: How many to add (default 1)
-        restaurant_url: Optional restaurant URL if not already on the page
+        restaurant_url: Store URL or slug (legacy path)
+        store_uuid: Merchant UUID (from search or menu payload)
+        section_uuid: Catalog section UUID (never the same as store_uuid; optional if resolvable from menu)
+        subsection_uuid: Submenu UUID (often empty; server retries with menu_item_uuid if needed)
+        menu_item_uuid: SKU / catalog item UUID
     """
     result = await ubereats.add_to_cart(
-        item_name,
+        item_name=item_name,
         quantity=quantity,
         restaurant_url=restaurant_url or None,
+        store_uuid=store_uuid,
+        section_uuid=section_uuid,
+        subsection_uuid=subsection_uuid,
+        menu_item_uuid=menu_item_uuid,
     )
     return json.dumps(result, indent=2, ensure_ascii=False)
 
@@ -242,10 +294,40 @@ async def uber_eats_remove_from_cart(item_name: str) -> str:
 
 
 @mcp.tool()
+async def uber_eats_update_cart_quantity(
+    quantity: int,
+    item_name: str = "",
+    shopping_cart_item_uuid: str = "",
+    grocery_store: bool = False,
+) -> str:
+    """
+    Change the quantity of a line already in the cart (same API the site uses for line updates).
+
+    Best: pass shopping_cart_item_uuid from uber_eats_view_cart items[].shopping_cart_item_uuid.
+    Otherwise match by item_name (partial match ok).
+
+    For large markets / grocery carts, set grocery_store=true if quantity updates fail without it.
+
+    Args:
+        quantity: New quantity (1 or more)
+        item_name: Line title to match if UUID not provided
+        shopping_cart_item_uuid: From view_cart items[] (preferred)
+        grocery_store: Hint for grocery / convenience store drafts
+    """
+    result = await ubereats.update_cart_line_quantity(
+        quantity,
+        item_name=item_name,
+        shopping_cart_item_uuid=shopping_cart_item_uuid,
+        grocery_store=grocery_store,
+    )
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
 async def uber_eats_view_cart() -> str:
     """
-    View the current cart contents with items, charges breakdown, and total.
-    Call this before checkout to let the user review their order.
+    View the current cart: line titles, quantities, shopping_cart_item_uuid per line (for updates),
+    and draft_order_uuid. Call before checkout so the user can review; use UUIDs when changing qty.
     """
     cart = await ubereats.view_cart()
     return json.dumps(cart, indent=2, ensure_ascii=False)
@@ -328,25 +410,30 @@ async def uber_eats_set_checkout_payment(
     draft_order_uuid: str,
     payment_profile_uuid: str,
     use_credits: str = "",
+    set_as_default: str = "",
 ) -> str:
     """
     Select payment method for checkout (API). Use payment UUIDs from
     uber_eats_list_payment_methods. Optionally set use_credits to 'true' or 'false'.
+    Set set_as_default to 'true' to also PATCH the account default card (payments profilePatch).
 
     Args:
         draft_order_uuid: Draft order UUID from checkout preview
         payment_profile_uuid: Payment profile UUID to charge
         use_credits: If 'true' or 'false', toggles Uber Cash/credits; empty leaves unchanged
+        set_as_default: If 'true', persist as default payment on the selected Uber profile
     """
     uc: bool | None = None
     if use_credits.strip().lower() == "true":
         uc = True
     elif use_credits.strip().lower() == "false":
         uc = False
+    sad = set_as_default.strip().lower() in ("1", "true", "yes")
     result = await ubereats.checkout_set_payment_profile(
         draft_order_uuid,
         payment_profile_uuid,
         use_credits=uc,
+        set_as_default=sad,
     )
     return json.dumps(result, indent=2, ensure_ascii=False)
 
@@ -384,7 +471,8 @@ async def uber_eats_checkout_preview() -> str:
 @mcp.tool()
 async def uber_eats_place_order() -> str:
     """
-    Place the order. NEVER call this without explicit user confirmation.
+    Place the order (tries API checkoutOrdersByDraftOrdersV1 first, then browser click).
+    NEVER call this without explicit user confirmation.
 
     REQUIRED before calling — ALL of these must be true:
     1. checkout_preview was called and summary was shown to the user
@@ -464,9 +552,9 @@ async def uber_eats_menu_item_detail(
 @mcp.tool()
 async def uber_eats_get_preferences() -> str:
     """
-    Get the user's saved preferences: default address, payment, tip,
-    dietary restrictions, favorites, budget, social contexts, taste profile,
-    and mood history. Call this at the start of each session to personalize.
+    Local preferences file (default address label, favorites, etc.). No browser.
+    Call first each session; then get_address—avoid opening login until an API
+    tool proves the Uber session is missing or expired.
     """
     prefs = preferences.load_preferences()
     return json.dumps(prefs, indent=2, ensure_ascii=False)
@@ -603,44 +691,12 @@ async def uber_eats_suggest_cart(
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
-# ── API Discovery ────────────────────────────────────────────────────────────
-
-@mcp.tool()
-async def uber_eats_discover_apis() -> str:
-    """
-    Open a headed browser in API discovery mode. The user browses
-    Uber Eats normally while every /_p/api/ and /api/ call is
-    captured with full request and response bodies.
-
-    Call uber_eats_stop_discovery when done to see captured endpoints.
-    """
-    result = await ubereats.start_api_discovery()
-    return json.dumps(result, indent=2, ensure_ascii=False)
-
-
-@mcp.tool()
-async def uber_eats_stop_discovery() -> str:
-    """
-    Stop API discovery mode, save the session, and return a summary
-    of all captured API endpoints with call counts and sample payloads.
-    """
-    result = await ubereats.stop_api_discovery()
-    return json.dumps(result, indent=2, ensure_ascii=False)
-
-
-@mcp.tool()
-async def uber_eats_discovery_log() -> str:
-    """
-    Return the full API discovery log — all captured calls with
-    complete request and response bodies. Use after uber_eats_stop_discovery
-    to inspect specific endpoints in detail.
-    """
-    result = ubereats.get_discovery_log()
-    return json.dumps(result, indent=2, ensure_ascii=False)
-
 
 def main() -> None:
     """Entry point for `uv run uber-eats-mcp` / `uber-eats-mcp` after install."""
+    quiet = os.environ.get("UBEREATS_QUIET", "").strip().lower() in ("1", "true", "yes", "on")
+    if not quiet:
+        terminal_art.print_startup_banner()
     mcp.run(transport="stdio")
 
 

@@ -5,31 +5,48 @@ Handles launching/reusing Chromium, persisting login sessions,
 capturing auth tokens from network requests,
 and switching between headed (login) and headless (automation) modes.
 
-API discovery mode writes full request/response payloads to
-~/.ubereats-api-log.jsonl so we can reverse-engineer endpoints.
+Headed tools (login, set_address, …) share one window size. Override with
+UBEREATS_BROWSER_VIEWPORT=WxH (e.g. 1100x800) if the default feels too large.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
-from datetime import datetime, timezone
+import os
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 
 from playwright.async_api import (
     Browser,
     BrowserContext,
     Page,
     Playwright,
-    Request,
     Response,
     async_playwright,
 )
 
+from .urls import BASE_URL, web_home_url
+
 SESSION_PATH = Path.home() / ".ubereats-session.json"
 CONFIG_PATH = Path.home() / ".ubereats-config.json"
-API_LOG_PATH = Path.home() / ".ubereats-api-log.jsonl"
-BASE_URL = "https://www.ubereats.com"
+
+_DEFAULT_VIEWPORT_W, _DEFAULT_VIEWPORT_H = 1280, 900
+
+
+def headed_browser_viewport() -> tuple[int, int]:
+    """Window + viewport size for headed interception (login, discovery, set_address, …)."""
+    raw = os.environ.get("UBEREATS_BROWSER_VIEWPORT", "").strip().lower().replace("*", "x")
+    if "x" in raw:
+        try:
+            a, b = raw.split("x", 1)
+            w, h = int(a.strip()), int(b.strip())
+            return max(320, min(w, 4096)), max(240, min(h, 2304))
+        except ValueError:
+            pass
+    return _DEFAULT_VIEWPORT_W, _DEFAULT_VIEWPORT_H
+
 
 NOISE_PATTERNS = frozenset([
     "/_events",
@@ -52,8 +69,8 @@ DEFAULT_HEADERS = {
     "accept": "application/json",
     "accept-language": "en-US,en;q=0.9",
     "content-type": "application/json",
-    "origin": "https://www.ubereats.com",
-    "referer": "https://www.ubereats.com/",
+    "origin": BASE_URL,
+    "referer": web_home_url(),
     "user-agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -129,11 +146,83 @@ class BrowserManager:
         self._page: Optional[Page] = None
         self.config: UberEatsConfig = UberEatsConfig.load() or UberEatsConfig()
         self._captured_api_calls: list[dict[str, Any]] = []
-        self._discovery_mode: bool = False
+        # True when the active page was created via launch_with_interception.
+        self._headed_intercept_active: bool = False
+        # Serialize close / launch / login so concurrent MCP tools cannot tear down the page mid-login.
+        self._lifecycle_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
+    @asynccontextmanager
+    async def exclusive_browser_session(self) -> AsyncIterator[BrowserManager]:
+        """Hold the browser lock for a whole flow (e.g. login). Caller must use _close_unlocked / _launch_* only."""
+        async with self._lifecycle_lock:
+            yield self
+
+    async def _close_unlocked(self) -> None:
+        """Tear down browser. Caller must hold _lifecycle_lock (or use close())."""
+        self._headed_intercept_active = False
+        if self._context:
+            try:
+                await self._context.close()
+            except Exception:
+                pass
+            self._context = None
+        if self._browser:
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+        if self._playwright:
+            try:
+                await self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
+        self._page = None
+
+    async def _launch_intercepted_page_unlocked(self) -> Page:
+        """Start headed Chromium + interception. Caller must hold _lifecycle_lock."""
+        await self._close_unlocked()
+        self._captured_api_calls = []
+
+        width, height = headed_browser_viewport()
+
+        self._playwright = await async_playwright().start()
+        self._browser = await self._playwright.chromium.launch(
+            headless=False,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                f"--window-size={width},{height}",
+            ],
+        )
+
+        storage_state = str(SESSION_PATH) if SESSION_PATH.exists() else None
+
+        self._context = await self._browser.new_context(
+            storage_state=storage_state,
+            viewport={"width": width, "height": height},
+            user_agent=DEFAULT_HEADERS["user-agent"],
+        )
+        self._page = await self._context.new_page()
+
+        self._page.on("response", self._on_response)
+
+        self._headed_intercept_active = True
+        return self._page
+
+    async def ensure_interactive_page(self) -> Page:
+        """Headed Chromium with response interception.
+
+        Reuses the current page if it was already opened on this stack (avoids extra restarts).
+        """
+        async with self._lifecycle_lock:
+            if self._headed_intercept_active and self._page and not self._page.is_closed():
+                return self._page
+            return await self._launch_intercepted_page_unlocked()
 
     async def launch(self, headless: bool = True) -> Page:
         """Launch (or reuse) a browser and return the active page."""
@@ -158,59 +247,16 @@ class BrowserManager:
             user_agent=DEFAULT_HEADERS["user-agent"],
         )
         self._page = await self._context.new_page()
+        self._headed_intercept_active = False
         return self._page
 
-    async def launch_with_interception(self, wide: bool = False) -> Page:
-        """Launch a headed browser with network interception for token capture."""
-        await self.close()
-        self._captured_api_calls = []
-
-        width, height = (1280, 900) if wide else (420, 800)
-
-        self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=False,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                f"--window-size={width},{height}",
-            ],
-        )
-
-        storage_state = str(SESSION_PATH) if SESSION_PATH.exists() else None
-
-        self._context = await self._browser.new_context(
-            storage_state=storage_state,
-            viewport={"width": width, "height": height},
-            user_agent=DEFAULT_HEADERS["user-agent"],
-        )
-        self._page = await self._context.new_page()
-
-        self._page.on("response", self._on_response)
-
-        return self._page
-
-    async def launch_discovery(self) -> Page:
-        """Launch a headed browser in API discovery mode.
-
-        Like launch_with_interception but also captures full request/response
-        bodies for all /_p/api/ and /api/ calls, writing them to API_LOG_PATH.
-        Uses a full-size desktop viewport so the user can access all UI elements.
-        """
-        if API_LOG_PATH.exists():
-            API_LOG_PATH.unlink()
-        page = await self.launch_with_interception(wide=True)
-        self._discovery_mode = True
-        return page
+    async def launch_with_interception(self) -> Page:
+        """Launch a headed browser with network interception."""
+        async with self._lifecycle_lock:
+            return await self._launch_intercepted_page_unlocked()
 
     def _is_noise(self, url: str) -> bool:
         return any(pattern in url for pattern in NOISE_PATTERNS)
-
-    def _is_api_call(self, url: str) -> bool:
-        return (
-            "ubereats.com" in url
-            and ("/_p/api/" in url or "/api/" in url)
-            and not self._is_noise(url)
-        )
 
     async def _on_response(self, response: Response) -> None:
         """Intercept network responses to capture auth tokens, API endpoints, and full payloads."""
@@ -272,7 +318,7 @@ class BrowserManager:
                     except Exception:
                         pass
 
-                if self._is_api_call(url):
+                if "ubereats.com" in url and ("/_p/api/" in url or "/api/" in url):
                     endpoint = url.split("ubereats.com")[-1].split("?")[0]
                     if endpoint not in [e.get("endpoint") for e in self.config.captured_endpoints]:
                         self.config.captured_endpoints.append({
@@ -280,71 +326,13 @@ class BrowserManager:
                             "method": request.method,
                         })
 
-            # In discovery mode, capture full payloads for API calls
-            if self._discovery_mode and self._is_api_call(url):
-                await self._log_api_call(request, response)
-
-        except Exception:
-            pass
-
-    async def _log_api_call(self, request: Request, response: Response) -> None:
-        """Write a full API call record to the JSONL log file."""
-        try:
-            endpoint = request.url.split("ubereats.com")[-1].split("?")[0]
-
-            request_body = None
-            if request.method == "POST":
-                try:
-                    raw = request.post_data
-                    if raw:
-                        request_body = json.loads(raw)
-                except Exception:
-                    request_body = request.post_data
-
-            response_body = None
-            try:
-                response_body = await response.json()
-            except Exception:
-                pass
-
-            record = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "method": request.method,
-                "endpoint": endpoint,
-                "url": request.url,
-                "request_body": request_body,
-                "response_status": response.status,
-                "response_body": response_body,
-            }
-
-            with open(API_LOG_PATH, "a") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
         except Exception:
             pass
 
     async def close(self) -> None:
         """Tear down browser resources."""
-        self._discovery_mode = False
-        if self._context:
-            try:
-                await self._context.close()
-            except Exception:
-                pass
-            self._context = None
-        if self._browser:
-            try:
-                await self._browser.close()
-            except Exception:
-                pass
-            self._browser = None
-        if self._playwright:
-            try:
-                await self._playwright.stop()
-            except Exception:
-                pass
-            self._playwright = None
-        self._page = None
+        async with self._lifecycle_lock:
+            await self._close_unlocked()
 
     # ------------------------------------------------------------------
     # Session persistence
@@ -401,69 +389,6 @@ class BrowserManager:
 
     def is_logged_in(self) -> bool:
         return self.has_session() and (self.config.is_valid or SESSION_PATH.exists())
-
-    # ------------------------------------------------------------------
-    # API discovery log
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def get_api_log() -> list[dict[str, Any]]:
-        """Read all captured API call records from the log file."""
-        if not API_LOG_PATH.exists():
-            return []
-        records: list[dict[str, Any]] = []
-        for line in API_LOG_PATH.read_text().splitlines():
-            line = line.strip()
-            if line:
-                try:
-                    records.append(json.loads(line))
-                except Exception:
-                    pass
-        return records
-
-    @staticmethod
-    def get_api_log_summary() -> dict[str, Any]:
-        """Summarize the captured API log: unique endpoints with call counts and sample bodies."""
-        records = BrowserManager.get_api_log()
-        if not records:
-            return {"total_calls": 0, "endpoints": [], "message": "No API calls captured yet."}
-
-        endpoints: dict[str, dict[str, Any]] = {}
-        for rec in records:
-            ep = rec.get("endpoint", "")
-            if ep not in endpoints:
-                endpoints[ep] = {
-                    "endpoint": ep,
-                    "method": rec.get("method", ""),
-                    "call_count": 0,
-                    "statuses": set(),
-                    "sample_request": rec.get("request_body"),
-                    "sample_response_keys": None,
-                }
-            info = endpoints[ep]
-            info["call_count"] += 1
-            info["statuses"].add(rec.get("response_status", 0))
-
-            resp = rec.get("response_body")
-            if resp and isinstance(resp, dict) and info["sample_response_keys"] is None:
-                info["sample_response_keys"] = list(resp.keys())[:15]
-
-        result_endpoints = []
-        for info in sorted(endpoints.values(), key=lambda x: x["call_count"], reverse=True):
-            result_endpoints.append({
-                "endpoint": info["endpoint"],
-                "method": info["method"],
-                "call_count": info["call_count"],
-                "statuses": sorted(info["statuses"]),
-                "sample_request": info["sample_request"],
-                "sample_response_keys": info["sample_response_keys"],
-            })
-
-        return {
-            "total_calls": len(records),
-            "unique_endpoints": len(result_endpoints),
-            "endpoints": result_endpoints,
-        }
 
 
 manager = BrowserManager()
