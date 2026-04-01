@@ -18,7 +18,6 @@ import sys
 
 from mcp.server.fastmcp import FastMCP
 
-from . import terminal_art
 from . import ubereats
 from . import preferences
 from . import recommender
@@ -694,9 +693,6 @@ async def uber_eats_suggest_cart(
 
 def main() -> None:
     """Entry point for `uv run uber-eats-mcp` / `uber-eats-mcp` after install."""
-    quiet = os.environ.get("UBEREATS_QUIET", "").strip().lower() in ("1", "true", "yes", "on")
-    if not quiet:
-        terminal_art.print_startup_banner()
     mcp.run(transport="stdio")
 
 
