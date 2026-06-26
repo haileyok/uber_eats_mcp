@@ -1,10 +1,13 @@
 """
 Uber Eats operations: login, search, menu, cart, checkout, orders.
 
-Uses direct HTTP API calls for most operations (fast, reliable).
-Browser (Playwright) is used for login and optional place_order fallback.
-Cart add/remove and item options use the web JSON API (addItemsToDraftOrderV2, etc.).
-Submit uses checkoutOrdersByDraftOrdersV1 when API path succeeds; set UBEREATS_PLACE_ORDER_BROWSER_ONLY=1 to force the browser button.
+When UBEREATS_CDP_PORT is set, all API calls route through a persistent Chrome
+instance via CDP (page.request.post), using Chrome's live cookie jar. When CDP
+is not configured, falls back to httpx with session file cookies.
+
+Login uses the CDP-connected Chrome when available, or a standalone headed
+browser otherwise. Place order uses the API path (checkoutOrdersByDraftOrdersV1)
+by default; set UBEREATS_PLACE_ORDER_BROWSER_ONLY=1 to force browser-click.
 """
 
 from __future__ import annotations

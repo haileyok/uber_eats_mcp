@@ -184,6 +184,8 @@ class BrowserManager:
         self._cdp_page: Optional[Page] = None
         # Keepalive task
         self._keepalive_task: Optional[asyncio.Task] = None
+        # Serialize CDP connect/reconnect so concurrent MCP tools don't race on shared refs.
+        self._cdp_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -338,33 +340,37 @@ class BrowserManager:
         return self._cdp_page
 
     async def ensure_cdp_page(self) -> Page:
-        """Return a live page connected via CDP, reconnecting if Chrome crashed/restarted."""
+        """Return a live page connected via CDP, reconnecting if Chrome crashed/restarted.
+
+        Serialized via _cdp_lock so concurrent MCP tools don't race on shared CDP refs.
+        """
         if not cdp_enabled():
             raise RuntimeError("UBEREATS_CDP_PORT is not set; cannot use CDP.")
 
-        # Fast path: cached page looks alive.
-        if self._cdp_page and not self._cdp_page.is_closed():
-            try:
-                # Lightweight liveness probe.
-                await asyncio.wait_for(
-                    self._cdp_context.cookies(), timeout=5
-                )
-                return self._cdp_page
-            except Exception:
-                # Page/context is stale — fall through to reconnect.
-                self._clear_cdp_refs()
+        async with self._cdp_lock:
+            # Fast path: cached page looks alive.
+            if self._cdp_page and not self._cdp_page.is_closed():
+                try:
+                    # Lightweight liveness probe.
+                    await asyncio.wait_for(
+                        self._cdp_context.cookies(), timeout=5
+                    )
+                    return self._cdp_page
+                except Exception:
+                    # Page/context is stale — fall through to reconnect.
+                    self._clear_cdp_refs()
 
-        # Reconnect from scratch.
-        # Stop the old Playwright instance if it lingers.
-        if self._cdp_playwright:
-            try:
-                await self._cdp_playwright.stop()
-            except Exception:
-                pass
-            self._cdp_playwright = None
-        self._clear_cdp_refs()
+            # Reconnect from scratch.
+            # Stop the old Playwright instance if it lingers.
+            if self._cdp_playwright:
+                try:
+                    await self._cdp_playwright.stop()
+                except Exception:
+                    pass
+                self._cdp_playwright = None
+            self._clear_cdp_refs()
 
-        return await self._connect_cdp()
+            return await self._connect_cdp()
 
     async def close_cdp(self) -> None:
         """Tear down the CDP connection (called on server shutdown, not on login teardown)."""

@@ -250,7 +250,7 @@ async def _read_csrf_from_browser() -> str:
         ctx = page.context
         for c in await ctx.cookies():
             name = c.get("name", "").lower()
-            if name in ("csrf", "csrftoken", "ct0"):
+            if name in ("csrf", "csrftoken", "ct0", "_csrf"):
                 val = c.get("value", "")
                 if val:
                     return val

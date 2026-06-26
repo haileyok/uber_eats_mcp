@@ -15,16 +15,30 @@ from __future__ import annotations
 import json
 import os
 import sys
+from contextlib import asynccontextmanager
 
 from mcp.server.fastmcp import FastMCP
 
 from . import ubereats
 from . import preferences
 from . import recommender
-from .browser import manager
+from .browser import manager, cdp_enabled
+
+
+@asynccontextmanager
+async def _lifespan(app):
+    """Start/stop the background keepalive task within the running event loop."""
+    if cdp_enabled():
+        manager.start_keepalive_task()
+    try:
+        yield
+    finally:
+        manager.stop_keepalive_task()
+
 
 mcp = FastMCP(
     "uber-eats",
+    lifespan=_lifespan,
     instructions="\n".join([
         "Uber Eats assistant. Order food and groceries from Uber Eats.",
         "",
@@ -707,12 +721,8 @@ async def uber_eats_keepalive() -> str:
 
 def main() -> None:
     """Entry point for `uv run uber-eats-mcp` / `uber-eats-mcp` after install."""
-    # Start the background keepalive task if CDP is configured.
-    manager.start_keepalive_task()
-    try:
-        mcp.run(transport="stdio")
-    finally:
-        manager.stop_keepalive_task()
+    # Keepalive task lifecycle is handled by the FastMCP lifespan context.
+    mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":
