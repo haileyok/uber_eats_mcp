@@ -291,7 +291,12 @@ async def _post(path: str, body: dict | None = None) -> dict[str, Any]:
             text = await response.text()
             return {"error": f"API returned {response.status}: {text[:200]}"}
 
-        parsed = await response.json()
+        try:
+            parsed = await response.json()
+        except Exception:
+            text = await response.text()
+            return {"error": f"Failed to parse response: {text[:200]}"}
+
         if isinstance(parsed, dict):
             return _coerce_uber_json_body(parsed)
         return parsed
@@ -360,7 +365,12 @@ async def _post_absolute_url(url: str, body: dict | None = None) -> dict[str, An
             text = await response.text()
             return {"error": f"API returned {response.status}: {text[:200]}"}
 
-        parsed = await response.json()
+        try:
+            parsed = await response.json()
+        except Exception:
+            text = await response.text()
+            return {"error": f"Failed to parse response: {text[:200]}"}
+
         if isinstance(parsed, dict):
             return _coerce_uber_json_body(parsed)
         return parsed

@@ -112,7 +112,6 @@ If `UBEREATS_CDP_PORT` is not set, the server falls back to the original behavio
 | `UBEREATS_CDP_PORT` | (unset) | CDP port to connect to. If unset, falls back to standalone browser launch + `httpx`. |
 | `UBEREATS_WEB_LOCALE` | `us-en` | Country-language path for Uber Eats web app. |
 | `UBEREATS_KEEPALIVE_INTERVAL_HOURS` | `4` | How often to auto-ping `ubereats.com` to refresh session cookies. Set to `0` to disable. |
-| `UBEREATS_AUTO_START_CHROME` | `0` | If `1`, the MCP server auto-launches Chrome with CDP on startup. |
 | `UBEREATS_PLACE_ORDER_BROWSER_ONLY` | `0` | If `1`, forces the browser-click path for placing orders (emergency override). |
 | `UBEREATS_LOG_API_CALLS` | `1` | Set to `0` to disable API call logging to `~/.ubereats-mcp-api-log.jsonl`. |
 

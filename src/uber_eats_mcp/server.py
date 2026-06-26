@@ -33,7 +33,8 @@ async def _lifespan(app):
     try:
         yield
     finally:
-        manager.stop_keepalive_task()
+        await manager.stop_keepalive_task()
+        await manager.close_cdp()
 
 
 mcp = FastMCP(
@@ -97,7 +98,7 @@ mcp = FastMCP(
         "  Step 5: Optionally use uber_eats_set_checkout_tip / uber_eats_set_checkout_payment with draft_order_uuid from checkout_preview.",
         "  Step 6: After payment and tip are decided, show the FINAL summary with the grand total (including tip).",
         "  Step 7: Ask: 'Should I place the order?' and WAIT for explicit confirmation.",
-        "  Step 8: ONLY after the user explicitly confirms, call place_order (API submit first; browser fallback if needed).",
+        "  Step 8: ONLY after the user explicitly confirms, call place_order (API via Chrome CDP).",
         "",
         "  NEVER call place_order without completing the confirmation steps above.",
         "  NEVER call place_order in the same turn as checkout_preview.",
@@ -484,7 +485,7 @@ async def uber_eats_checkout_preview() -> str:
 @mcp.tool()
 async def uber_eats_place_order() -> str:
     """
-    Place the order (tries API checkoutOrdersByDraftOrdersV1 first, then browser click).
+    Place the order via API (checkoutOrdersByDraftOrdersV1) through Chrome CDP.
     NEVER call this without explicit user confirmation.
 
     REQUIRED before calling — ALL of these must be true:

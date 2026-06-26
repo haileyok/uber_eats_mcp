@@ -374,20 +374,21 @@ class BrowserManager:
 
     async def close_cdp(self) -> None:
         """Tear down the CDP connection (called on server shutdown, not on login teardown)."""
-        self._cdp_page = None
-        self._cdp_context = None
-        if self._cdp_browser:
-            try:
-                await self._cdp_browser.close()
-            except Exception:
-                pass
-            self._cdp_browser = None
-        if self._cdp_playwright:
-            try:
-                await self._cdp_playwright.stop()
-            except Exception:
-                pass
-            self._cdp_playwright = None
+        async with self._cdp_lock:
+            self._cdp_page = None
+            self._cdp_context = None
+            if self._cdp_browser:
+                try:
+                    await self._cdp_browser.close()
+                except Exception:
+                    pass
+                self._cdp_browser = None
+            if self._cdp_playwright:
+                try:
+                    await self._cdp_playwright.stop()
+                except Exception:
+                    pass
+                self._cdp_playwright = None
 
     # ------------------------------------------------------------------
     # Keep-alive
@@ -465,10 +466,14 @@ class BrowserManager:
             return
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())
 
-    def stop_keepalive_task(self) -> None:
-        """Cancel the background keepalive task (call on server shutdown)."""
+    async def stop_keepalive_task(self) -> None:
+        """Cancel and await the background keepalive task (call on server shutdown)."""
         if self._keepalive_task and not self._keepalive_task.done():
             self._keepalive_task.cancel()
+            try:
+                await self._keepalive_task
+            except Exception:
+                pass
         self._keepalive_task = None
 
     def _is_noise(self, url: str) -> bool:
@@ -559,13 +564,15 @@ class BrowserManager:
 
     async def save_session(self) -> str:
         """Persist cookies / localStorage so future runs skip login."""
-        if not self._context:
+        # Use the CDP context when available, otherwise the headed-browser context.
+        ctx = self._cdp_context or self._context
+        if not ctx:
             return "No browser context to save."
 
-        state = await self._context.storage_state()
+        state = await ctx.storage_state()
         SESSION_PATH.write_text(json.dumps(state, indent=2))
 
-        cookies = await self._context.cookies()
+        cookies = await ctx.cookies()
         for cookie in cookies:
             self.config.cookies[cookie["name"]] = cookie["value"]
             if cookie["name"] == "sid":
