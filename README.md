@@ -45,13 +45,20 @@ Start a persistent Chrome instance with remote debugging enabled:
 ```bash
 ./scripts/start_chrome.sh
 # or directly:
-"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-port=9222 --headless=new --disable-gpu --no-sandbox
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --remote-debugging-port=9222 \
+  --user-data-dir=~/.ubereats-chrome-profile \
+  --headless=new --disable-gpu --no-sandbox --no-first-run
 ```
 
 **Linux:**
 ```bash
-google-chrome --remote-debugging-port=9222 --headless=new --disable-gpu --no-sandbox
+google-chrome --remote-debugging-port=9222 \
+  --user-data-dir=~/.ubereats-chrome-profile \
+  --headless=new --disable-gpu --no-sandbox --no-first-run
 ```
+
+> **Note:** Chrome 136+ ignores `--remote-debugging-port` for the default profile. You must use a dedicated `--user-data-dir` (the script handles this automatically).
 
 For **login** (which requires user interaction with 2FA/captcha), start Chrome **headed** instead:
 ```bash

@@ -10,6 +10,9 @@
 #
 # On macOS, this uses the Google Chrome.app binary automatically.
 # On Linux, it expects `google-chrome` or `chromium` on PATH.
+#
+# Chrome 136+ ignores --remote-debugging-port for the default profile, so we
+# use a dedicated user-data-dir. Override with UBEREATS_CHROME_USER_DATA_DIR.
 
 set -euo pipefail
 
@@ -29,8 +32,12 @@ else
   exit 1
 fi
 
+USER_DATA_DIR="${UBEREATS_CHROME_USER_DATA_DIR:-${HOME}/.ubereats-chrome-profile}"
+
 ARGS=(
   "--remote-debugging-port=${PORT}"
+  "--user-data-dir=${USER_DATA_DIR}"
+  "--no-first-run"
   "--disable-gpu"
   "--no-sandbox"
   "--disable-blink-features=AutomationControlled"
@@ -42,6 +49,7 @@ fi
 
 echo "Starting Chrome on CDP port ${PORT}..."
 echo "  Binary: ${CHROME}"
+echo "  User data dir: ${USER_DATA_DIR}"
 echo "  Headless: $([[ "${HEADED}" == "--headed" ]] && echo "no" || echo "yes")"
 echo ""
 echo "Connect with UBEREATS_CDP_PORT=${PORT}"
