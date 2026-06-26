@@ -552,7 +552,7 @@ class BrowserManager:
 
     async def close(self) -> None:
         """Tear down browser resources."""
-        self.stop_keepalive_task()
+        await self.stop_keepalive_task()
         async with self._lifecycle_lock:
             await self._close_unlocked()
         # CDP connection has its own lifecycle; tear it down after the headed browser.
