@@ -373,16 +373,16 @@ class BrowserManager:
             return await self._connect_cdp()
 
     async def close_cdp(self) -> None:
-        """Tear down the CDP connection (called on server shutdown, not on login teardown)."""
+        """Tear down the CDP connection (called on server shutdown, not on login teardown).
+
+        CRITICAL: does NOT call browser.close() on the CDP-connected browser — that would
+        terminate the externally-managed Chrome instance. We only stop the Playwright driver
+        that connects to it, leaving Chrome itself running for the next server start.
+        """
         async with self._cdp_lock:
             self._cdp_page = None
             self._cdp_context = None
-            if self._cdp_browser:
-                try:
-                    await self._cdp_browser.close()
-                except Exception:
-                    pass
-                self._cdp_browser = None
+            self._cdp_browser = None
             if self._cdp_playwright:
                 try:
                     await self._cdp_playwright.stop()
