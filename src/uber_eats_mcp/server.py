@@ -690,10 +690,29 @@ async def uber_eats_suggest_cart(
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
+@mcp.tool()
+async def uber_eats_keepalive() -> str:
+    """
+    Refresh the Uber Eats session by navigating to ubereats.com through the
+    persistent Chrome instance. This refreshes sliding session cookies so the
+    session doesn't expire during long idle periods.
+
+    The server also runs an internal keepalive task automatically (every
+    UBEREATS_KEEPALIVE_INTERVAL_HOURS, default 4h). This tool is a secondary
+    mechanism — call it manually or via a scheduler if you want an extra ping.
+    """
+    result = await manager.keepalive()
+    return json.dumps({"result": result}, indent=2, ensure_ascii=False)
+
 
 def main() -> None:
     """Entry point for `uv run uber-eats-mcp` / `uber-eats-mcp` after install."""
-    mcp.run(transport="stdio")
+    # Start the background keepalive task if CDP is configured.
+    manager.start_keepalive_task()
+    try:
+        mcp.run(transport="stdio")
+    finally:
+        manager.stop_keepalive_task()
 
 
 if __name__ == "__main__":

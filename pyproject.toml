@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "uber-eats-mcp"
-version = "0.1.0"
-description = "MCP server for ordering food on Uber Eats"
+version = "0.2.0"
+description = "MCP server for ordering food on Uber Eats (CDP-based persistent browser session fork)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

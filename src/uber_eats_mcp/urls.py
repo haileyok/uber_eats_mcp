@@ -14,7 +14,7 @@ BASE_URL = "https://www.ubereats.com"
 
 def web_locale_path() -> str:
     """Segment after the host, e.g. ``cl-en``, ``us-en``. Empty string = use ``/`` only."""
-    return os.environ.get("UBEREATS_WEB_LOCALE", "cl-en").strip().strip("/")
+    return os.environ.get("UBEREATS_WEB_LOCALE", "us-en").strip().strip("/")
 
 
 def web_home_url() -> str:

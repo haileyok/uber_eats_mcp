@@ -35,6 +35,32 @@ CONFIG_PATH = Path.home() / ".ubereats-config.json"
 _DEFAULT_VIEWPORT_W, _DEFAULT_VIEWPORT_H = 1280, 900
 
 
+def _cdp_port() -> int:
+    """CDP port to connect to. 0 = CDP disabled."""
+    raw = os.environ.get("UBEREATS_CDP_PORT", "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(1, min(int(raw), 65535))
+    except ValueError:
+        return 0
+
+
+def cdp_enabled() -> bool:
+    return _cdp_port() > 0
+
+
+def _keepalive_interval_seconds() -> float:
+    """Auto-ping interval for sliding session cookies. 0 = disabled."""
+    raw = os.environ.get("UBEREATS_KEEPALIVE_INTERVAL_HOURS", "").strip()
+    if not raw:
+        return 4.0 * 3600.0
+    try:
+        return float(raw) * 3600.0
+    except ValueError:
+        return 4.0 * 3600.0
+
+
 def headed_browser_viewport() -> tuple[int, int]:
     """Window + viewport size for headed interception (login, discovery, set_address, …)."""
     raw = os.environ.get("UBEREATS_BROWSER_VIEWPORT", "").strip().lower().replace("*", "x")
@@ -151,6 +177,14 @@ class BrowserManager:
         # Serialize close / launch / login so concurrent MCP tools cannot tear down the page mid-login.
         self._lifecycle_lock = asyncio.Lock()
 
+        # --- CDP persistent connection (separate lifecycle from headed login) ---
+        self._cdp_playwright: Optional[Playwright] = None
+        self._cdp_browser: Optional[Browser] = None
+        self._cdp_context: Optional[BrowserContext] = None
+        self._cdp_page: Optional[Page] = None
+        # Keepalive task
+        self._keepalive_task: Optional[asyncio.Task] = None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -255,6 +289,182 @@ class BrowserManager:
         async with self._lifecycle_lock:
             return await self._launch_intercepted_page_unlocked()
 
+    # ------------------------------------------------------------------
+    # CDP persistent connection
+    # ------------------------------------------------------------------
+
+    def _clear_cdp_refs(self) -> None:
+        """Null out cached CDP references so the next call reconnects."""
+        self._cdp_page = None
+        self._cdp_context = None
+        self._cdp_browser = None
+
+    async def _connect_cdp(self) -> Page:
+        """Connect to a running Chrome instance via CDP and return its default-context page.
+
+        CRITICAL: reuses the browser's DEFAULT context (browser.contexts[0]) which carries
+        login cookies. NEVER calls browser.new_context() — new contexts are cookie-isolated
+        and would cause every API call to 401.
+        """
+        port = _cdp_port()
+        if not port:
+            raise RuntimeError("UBEREATS_CDP_PORT is not set; cannot connect via CDP.")
+
+        if not self._cdp_playwright:
+            self._cdp_playwright = await async_playwright().start()
+
+        self._cdp_browser = await self._cdp_playwright.chromium.connect_over_cdp(
+            f"http://localhost:{port}"
+        )
+
+        # Reuse the DEFAULT context (carries login cookies). Do NOT create a new one.
+        contexts = self._cdp_browser.contexts
+        if contexts:
+            self._cdp_context = contexts[0]
+        else:
+            # No existing context — create one on the connected browser.
+            self._cdp_context = await self._cdp_browser.new_context()
+
+        # Get existing page or create a new one on the default context.
+        pages = self._cdp_context.pages
+        if pages:
+            self._cdp_page = pages[0]
+        else:
+            self._cdp_page = await self._cdp_context.new_page()
+
+        # Attach response interception so auth tokens are still captured.
+        self._cdp_page.on("response", self._on_response)
+
+        return self._cdp_page
+
+    async def ensure_cdp_page(self) -> Page:
+        """Return a live page connected via CDP, reconnecting if Chrome crashed/restarted."""
+        if not cdp_enabled():
+            raise RuntimeError("UBEREATS_CDP_PORT is not set; cannot use CDP.")
+
+        # Fast path: cached page looks alive.
+        if self._cdp_page and not self._cdp_page.is_closed():
+            try:
+                # Lightweight liveness probe.
+                await asyncio.wait_for(
+                    self._cdp_context.cookies(), timeout=5
+                )
+                return self._cdp_page
+            except Exception:
+                # Page/context is stale — fall through to reconnect.
+                self._clear_cdp_refs()
+
+        # Reconnect from scratch.
+        # Stop the old Playwright instance if it lingers.
+        if self._cdp_playwright:
+            try:
+                await self._cdp_playwright.stop()
+            except Exception:
+                pass
+            self._cdp_playwright = None
+        self._clear_cdp_refs()
+
+        return await self._connect_cdp()
+
+    async def close_cdp(self) -> None:
+        """Tear down the CDP connection (called on server shutdown, not on login teardown)."""
+        self._cdp_page = None
+        self._cdp_context = None
+        if self._cdp_browser:
+            try:
+                await self._cdp_browser.close()
+            except Exception:
+                pass
+            self._cdp_browser = None
+        if self._cdp_playwright:
+            try:
+                await self._cdp_playwright.stop()
+            except Exception:
+                pass
+            self._cdp_playwright = None
+
+    # ------------------------------------------------------------------
+    # Keep-alive
+    # ------------------------------------------------------------------
+
+    async def keepalive(self) -> str:
+        """Navigate to ubereats.com to refresh sliding session cookies."""
+        try:
+            page = await self.ensure_cdp_page()
+            await page.goto(web_home_url(), wait_until="domcontentloaded")
+            return "Keepalive: navigated to ubereats.com."
+        except Exception as exc:
+            return f"Keepalive failed: {exc}"
+
+    async def load_session_into_cdp(self) -> str:
+        """Load cookies from ~/.ubereats-session.json into the CDP context.
+
+        Supports the cookie-import login path: the user exports a Playwright
+        storage_state JSON from their regular browser and places it at the
+        session path. This loads those cookies into Chrome's live cookie jar
+        so page.request.post() can use them.
+        """
+        if not cdp_enabled():
+            return "CDP not enabled; nothing to load."
+        if not SESSION_PATH.exists():
+            return "No session file found at ~/.ubereats-session.json."
+        try:
+            state = json.loads(SESSION_PATH.read_text())
+            cookies = state.get("cookies", [])
+            if not cookies:
+                return "Session file has no cookies."
+            page = await self.ensure_cdp_page()
+            ctx = page.context
+            await ctx.add_cookies(cookies)
+            # Load localStorage if present.
+            origins = state.get("origins", [])
+            if origins:
+                for origin in origins:
+                    local_storage = origin.get("localStorage", [])
+                    if local_storage:
+                        script_lines = []
+                        for entry in local_storage:
+                            name = entry.get("name", "")
+                            value = entry.get("value", "")
+                            script_lines.append(
+                                f"localStorage.setItem({json.dumps(name)}, {json.dumps(value)});"
+                            )
+                        if script_lines:
+                            await ctx.add_init_script("\n".join(script_lines))
+            return f"Loaded {len(cookies)} cookies into CDP context."
+        except Exception as exc:
+            return f"Failed to load session into CDP: {exc}"
+
+    async def _keepalive_loop(self) -> None:
+        """Internal asyncio task that periodically pings ubereats.com."""
+        interval = _keepalive_interval_seconds()
+        if interval <= 0:
+            return
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await self.keepalive()
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            pass
+
+    def start_keepalive_task(self) -> None:
+        """Start the background keepalive task (call on server init)."""
+        if self._keepalive_task and not self._keepalive_task.done():
+            return
+        interval = _keepalive_interval_seconds()
+        if interval <= 0:
+            return
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+
+    def stop_keepalive_task(self) -> None:
+        """Cancel the background keepalive task (call on server shutdown)."""
+        if self._keepalive_task and not self._keepalive_task.done():
+            self._keepalive_task.cancel()
+        self._keepalive_task = None
+
     def _is_noise(self, url: str) -> bool:
         return any(pattern in url for pattern in NOISE_PATTERNS)
 
@@ -331,8 +541,11 @@ class BrowserManager:
 
     async def close(self) -> None:
         """Tear down browser resources."""
+        self.stop_keepalive_task()
         async with self._lifecycle_lock:
             await self._close_unlocked()
+        # CDP connection has its own lifecycle; tear it down after the headed browser.
+        await self.close_cdp()
 
     # ------------------------------------------------------------------
     # Session persistence

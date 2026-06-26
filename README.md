@@ -1,112 +1,148 @@
-# Claude, I’m hungry. 🍜
+# Claude, I'm hungry. 🍜
 
-Order food from Uber Eats through natural language in **Cursor** or **Claude Code** — with an assistant that can browse menus, prep checkout, and (when you say so) place the order.
+Order food from Uber Eats through natural language in **Cursor**, **Claude Code**, or any MCP-compatible client — with an assistant that can browse menus, prep checkout, and (when you say so) place the order.
 
-This project is an [**MCP server**](https://modelcontextprotocol.io/) (Model Context Protocol): a small program your AI client starts over **stdio** so it can call tools like `uber_eats_search` and `uber_eats_checkout_preview`.  
-It is **not** a Cursor extension / VS Code plugin.
+This is a **fork** of [`matiasconcha11/uber_eats_mcp`](https://github.com/matiasconcha11/uber_eats_mcp) that routes all API calls through a **persistent Chrome instance via Chrome DevTools Protocol (CDP)**, eliminating session expiry problems and avoiding any visible browser window during normal operation.
 
-Under the hood: **Uber web JSON APIs** for search, menus, cart (add/remove via `addItemsToDraftOrderV2` / `removeItemsFromDraftOrderV2`), checkout, and orders. **Playwright** is used for **login**, optional **address picker** UI, and **place order fallback** when API submit is unavailable or fails.
-
----
-
-## What you can do
-
-- **Browse & decide fast**
-  - Search and browse nearby stores
-  - Pull full menus with categories and item prices
-  - Get item detail payloads (including customization metadata where available)
-- **Cart & checkout prep**
-  - View cart via API (draft order + carts view)
-  - Checkout preview with totals, fees, tip options, and delivery address
-  - List eligible payment methods (when cart is non-empty)
-  - Set checkout tip / select payment / apply promo / view savings
-- **Orders**
-  - Track **active** orders (and past orders)
-  - “Reorder helper” that resolves the store + previous items (then add with `uber_eats_add_to_cart` API)
-- **Reverse-engineering mode**
-  - Run an API discovery browser that logs full request/response bodies to `~/.ubereats-api-log.jsonl`
+This project is an [**MCP server**](https://modelcontextprotocol.io/) (Model Context Protocol): a small program your AI client starts over **stdio** so it can call tools like `uber_eats_search` and `uber_eats_checkout_preview`.
 
 ---
 
-## Quick start (after `git clone`)
+## What changed from the original
 
-From inside **`uber-eats-mcp/`** (this folder):
+The original server authenticated by extracting cookies from a Playwright session and replaying them via `httpx`. This works but has two problems:
 
-**macOS / Linux**
+1. **Session expiry** — `httpx` doesn't process `set-cookie` response headers, so refreshed cookies are discarded.
+2. **Anti-bot 401s** — Uber blocks some mutations (notably `createDraftOrderV2`) when sent from `httpx`, even with valid cookies.
+
+**This fork** routes all API calls through Chrome's `page.request.post()`. Chrome maintains the cookie jar natively — `set-cookie` responses are processed automatically, CSRF tokens stay current, and anti-bot detection is satisfied because requests come from a real browser context. A keep-alive mechanism periodically navigates to `ubereats.com` to refresh sliding session cookies.
+
+---
+
+## Quick start
+
+### Prerequisites
+
+- **Python ≥ 3.12**
+- **[uv](https://docs.astral.sh/uv/getting-started/installation/)**
+- **Chrome/Chromium** installed (Playwright's bundled Chromium works too)
+- An Uber Eats account with a saved payment method
+
+### Setup
 
 ```bash
-chmod +x scripts/setup.sh
-./scripts/setup.sh
-```
-
-**Windows (PowerShell)**
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
-```
-
-**Manual (same as the scripts)**
-
-```bash
+git clone <your-fork-url>
+cd uber_eats_mcp
 uv sync
 uv run playwright install chromium
 ```
 
-The setup script prints a **ready-to-paste JSON** block with the correct path to this clone.
+### Start Chrome with CDP
 
----
+Start a persistent Chrome instance with remote debugging enabled:
 
-## Connect Cursor
+**macOS:**
+```bash
+./scripts/start_chrome.sh
+# or directly:
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-port=9222 --headless=new --disable-gpu --no-sandbox
+```
 
-1. Open **Cursor → Settings → MCP** (or edit the MCP config file your Cursor version uses).
-2. **Merge** the `uber-eats` entry into your existing `mcpServers` object (do not delete other servers).
-3. Restart Cursor or reload MCP.
+**Linux:**
+```bash
+google-chrome --remote-debugging-port=9222 --headless=new --disable-gpu --no-sandbox
+```
 
-If you prefer a **project-local** config, add `.cursor/mcp.json` in a project and paste the same `mcpServers` snippet.
+For **login** (which requires user interaction with 2FA/captcha), start Chrome **headed** instead:
+```bash
+./scripts/start_chrome.sh 9222 --headed
+```
 
-Example shape (use the **exact output** from `./scripts/setup.sh` so paths match your machine):
+### Configure your MCP client
+
+Use the `uber-eats-mcp` entry point with `UBEREATS_CDP_PORT` and `UBEREATS_WEB_LOCALE` env vars:
 
 ```json
 {
   "mcpServers": {
-    "uber-eats": {
+    "ubereats": {
       "command": "uv",
-      "args": ["run", "--directory", "/path/to/uber-eats-mcp", "uber-eats-mcp"]
+      "args": ["run", "--directory", "/path/to/uber_eats_mcp", "uber-eats-mcp"],
+      "env": {
+        "UBEREATS_CDP_PORT": "9222",
+        "UBEREATS_WEB_LOCALE": "us-en"
+      }
     }
   }
 }
 ```
 
-Requires **`uv`** on your `PATH`: [install uv](https://docs.astral.sh/uv/getting-started/installation/).
+---
 
-### Optional: “I’m hungry” Cursor rule
+## Initial login
 
-This repo includes **`.cursor/rules/uber-eats-hungry.mdc`**, which nudges the agent to **call** the Uber Eats tools when you sound hungry or want to order.
+Login is the one step that requires human interaction — Uber's flow includes 2FA, SMS codes, and captcha challenges that cannot be automated. There are two paths:
 
-- It is **not** part of the **`pip` / wheel install** — `pyproject.toml` only packages the Python server (`server.py`, `api.py`, …). Cloning the repo (or copying the file) is what brings the rule in.
-- For Cursor to load it, open **`uber-eats-mcp`** as the **project root**, or copy `uber-eats-hungry.mdc` into your own app’s `.cursor/rules/`.
+### Option A: CDP login (recommended)
+
+1. Start Chrome **headed** (not `--headless=new`): `./scripts/start_chrome.sh 9222 --headed`
+2. Run `uber_eats_login` — the MCP server navigates the CDP-connected Chrome to the Uber Eats login page.
+3. Log in manually in the Chrome window (handle 2FA/captcha as needed).
+4. The session persists in Chrome's cookie jar. You can restart Chrome with `--headless=new` for ongoing operation (using the same `--user-data-dir`), or keep it headed.
+
+### Option B: Cookie import (headless-only setups)
+
+1. Log into Uber Eats in your regular browser.
+2. Export the session as a Playwright `storage_state` JSON file (cookies + localStorage).
+3. Place it at `~/.ubereats-session.json`.
+4. Run `uber_eats_whoami` to verify.
+
+This requires re-exporting when the session expires, but the keep-alive mechanism makes that infrequent.
+
+### Option C: Standalone headed browser (fallback, no CDP)
+
+If `UBEREATS_CDP_PORT` is not set, the server falls back to the original behavior: launching a standalone headed Chromium for login via Playwright. Session is saved to `~/.ubereats-session.json` and API calls use `httpx`. This path has the session-expiry and anti-bot limitations described above.
 
 ---
 
-## Connect Claude Code
+## Environment variables
 
-Add an **`.mcp.json`** at the root of the project you open in Claude Code (or use the global location your version documents). Use the same `mcpServers` JSON as above.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `UBEREATS_CDP_PORT` | (unset) | CDP port to connect to. If unset, falls back to standalone browser launch + `httpx`. |
+| `UBEREATS_WEB_LOCALE` | `us-en` | Country-language path for Uber Eats web app. |
+| `UBEREATS_KEEPALIVE_INTERVAL_HOURS` | `4` | How often to auto-ping `ubereats.com` to refresh session cookies. Set to `0` to disable. |
+| `UBEREATS_AUTO_START_CHROME` | `0` | If `1`, the MCP server auto-launches Chrome with CDP on startup. |
+| `UBEREATS_PLACE_ORDER_BROWSER_ONLY` | `0` | If `1`, forces the browser-click path for placing orders (emergency override). |
+| `UBEREATS_LOG_API_CALLS` | `1` | Set to `0` to disable API call logging to `~/.ubereats-mcp-api-log.jsonl`. |
 
 ---
 
-## Typical flow (what the assistant should do)
+## Keep-alive
 
-1. `uber_eats_login`
+The MCP server runs an internal asyncio task that pings `ubereats.com` every `UBEREATS_KEEPALIVE_INTERVAL_HOURS` (default 4h). This is the primary session-refresh mechanism — it runs independently of any MCP client.
+
+A secondary `uber_eats_keepalive` tool is exposed so a scheduler (e.g. Victrola) can trigger an extra ping:
+
+```
+Call the ubereats.keepalive tool to refresh the Uber Eats session.
+```
+
+---
+
+## Typical flow
+
+1. `uber_eats_login` (CDP or cookie import)
 2. `uber_eats_get_preferences` (optional personalization)
 3. `uber_eats_get_address` (confirm delivery address)
 4. `uber_eats_search` or `uber_eats_nearby_restaurants`
 5. `uber_eats_restaurant_menu` → decide items
 6. If needed: `uber_eats_menu_item_detail` / `uber_eats_get_item_options`
-7. `uber_eats_add_to_cart` (API — requires `restaurant_url`)
+7. `uber_eats_add_to_cart` (API via Chrome)
 8. `uber_eats_view_cart`
 9. `uber_eats_checkout_preview`
 10. Optional: `uber_eats_list_payment_methods`, `uber_eats_set_checkout_payment`, `uber_eats_set_checkout_tip`, `uber_eats_apply_promo`
-11. Only after explicit confirmation: `uber_eats_place_order` (API submit first, browser fallback if needed)
+11. Only after explicit confirmation: `uber_eats_place_order`
 
 ---
 
@@ -116,46 +152,13 @@ Add an **`.mcp.json`** at the root of the project you open in Claude Code (or us
 uv run uber-eats-mcp
 ```
 
-or
-
-```bash
-uv run python server.py
-```
-
----
-
-## Environment (optional)
-
-| Variable | Meaning |
-|----------|---------|
-| `UBEREATS_WEB_LOCALE` | Country-language path for the **website** (login, address UI, discovery). Default **`cl-en`** (Chile, English), matching `https://www.ubereats.com/cl-en`. Set to **`us-en`**, **`mx-en`**, etc. for other regions, or **empty** to open `https://www.ubereats.com/` only. |
-| `UBEREATS_QUIET` | If `1` / `true`, hides the MCP startup banner on stderr. |
-| `UBEREATS_LOGIN_TRACE` | Default **on**: each `uber_eats_login` clears then appends JSON lines to **`~/.ubereats-mcp-login-trace.jsonl`** (no cookie values). In another terminal: `tail -f ~/.ubereats-mcp-login-trace.jsonl`. Set to **`0`** to disable. After a successful save, look for **`storage_audit_after_save`**: `session_file_exists`, positive `session_cookie_entries`, `session_includes_sid_cookie`, `config_file_exists`, `config_has_sid_field` — that pattern means disk storage looks healthy. |
-| `UBEREATS_DISCOVERY_LOG` | Path to the **browser discovery** JSONL (full API request/response bodies). Default **`~/.ubereats-api-log.jsonl`**. Set to e.g. **`…/uber-eats-mcp/discovery-api-log.jsonl`** so logs stay in this repo; `scripts/run_discovery_interactive.py` sets that automatically. **Cursor MCP:** add the same path under `env` for `uber_eats_discover_apis`. |
-
-**Headed browser (login, address, discovery):** only one flow runs at a time. If the assistant triggers **`uber_eats_login` twice in parallel**, or login runs while another tool opens the same browser, Playwright can error with *page or browser has been closed*—run **one** login and wait for it to finish.
-
 ---
 
 ## What gets stored locally
 
-Session and preferences are under your home directory (e.g. `~/.ubereats-session.json`, `~/.ubereats-preferences.json`). Do not commit those.
+Session and preferences are under your home directory (e.g. `~/.ubereats-session.json`, `~/.ubereats-config.json`, `~/.ubereats-preferences.json`). Do not commit those.
 
-If login fails mid-way, you may see **`~/.ubereats-session.json.prelogin.bak`** (and a matching **`.ubereats-config.json.prelogin.bak`**). A successful retry restores them automatically; if **`*.prelogin.bak`** exists but the main files do not, you can recover manually: copy each `*.prelogin.bak` over the non-`.bak` filename (then remove the `.bak` files if you like).
-
----
-
-## Prerequisites
-
-- **Python ≥ 3.12**
-- **[uv](https://docs.astral.sh/uv/getting-started/installation/)** (recommended) or another way to install from `pyproject.toml`
-- **Chromium** via Playwright (`playwright install chromium` — included in the setup scripts)
-
----
-
-## More tools
-
-See the tool list in Cursor/Claude Code after connecting. The implementation lives in `server.py`.
+When CDP is enabled, the **source of truth for auth is Chrome's cookie jar**, not the session file. The session file may still be written for backwards compatibility, but deleting it while Chrome is running with valid cookies will not cause auth failures.
 
 ---
 

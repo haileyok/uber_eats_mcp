@@ -48,6 +48,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
 
 import httpx
 
+from .browser import manager as browser_manager, cdp_enabled
 from .urls import BASE_URL, web_home_url
 
 SESSION_PATH = Path.home() / ".ubereats-session.json"
@@ -107,12 +108,19 @@ def _csrf_token_value() -> str:
     return "x"
 
 
-def _api_headers() -> dict[str, str]:
+def _api_headers(csrf: str = "") -> dict[str, str]:
+    """Build headers for Uber API calls.
+
+    When *csrf* is provided (e.g. read from the live Chrome cookie jar), use it
+    instead of the stale disk-based value. Falls back to _csrf_token_value() when
+    empty (non-CDP path).
+    """
+    token = csrf.strip() if csrf else _csrf_token_value()
     return {
         **DEFAULT_HEADERS,
         "origin": BASE_URL,
         "referer": web_home_url(),
-        "x-csrf-token": _csrf_token_value(),
+        "x-csrf-token": token,
     }
 
 
@@ -233,13 +241,66 @@ def _append_mcp_api_call_log(
         pass
 
 
+async def _read_csrf_from_browser() -> str:
+    """Read the CSRF token from the live Chrome cookie jar (CDP path)."""
+    if not cdp_enabled():
+        return ""
+    try:
+        page = await browser_manager.ensure_cdp_page()
+        ctx = page.context
+        for c in await ctx.cookies():
+            name = c.get("name", "").lower()
+            if name in ("csrf", "csrftoken", "ct0"):
+                val = c.get("value", "")
+                if val:
+                    return val
+    except Exception:
+        pass
+    return ""
+
+
 async def _post(path: str, body: dict | None = None) -> dict[str, Any]:
-    """Make an authenticated POST to the Uber Eats API."""
+    """Make an authenticated POST to the Uber Eats API.
+
+    When CDP is enabled, routes through Chrome's page.request.post() which uses the
+    live cookie jar automatically — set-cookie responses are processed, CSRF tokens
+    stay current, and anti-bot detection is satisfied because requests come from a
+    real browser context. Falls back to httpx when CDP is not configured.
+    """
+    full_url = f"{BASE_URL.rstrip('/')}{path}" if path.startswith("/") else f"{BASE_URL.rstrip('/')}/{path}"
+
+    if cdp_enabled():
+        page = await browser_manager.ensure_cdp_page()
+        ctx = page.context
+
+        # Read CSRF from live Chrome cookie jar (not stale disk file).
+        csrf = await _read_csrf_from_browser()
+
+        # page.request uses Chrome's cookie jar automatically — no manual cookie building.
+        response = await page.request.post(
+            full_url,
+            headers=_api_headers(csrf=csrf),
+            data=body or {},  # Playwright serializes dict to JSON + sets content-type.
+        )
+
+        _append_mcp_api_call_log(full_url=full_url, status_code=response.status)
+
+        if response.status in (401, 403):
+            return {"error": "Session expired or invalid. Use uber_eats_login to re-authenticate."}
+        if response.status != 200:
+            text = await response.text()
+            return {"error": f"API returned {response.status}: {text[:200]}"}
+
+        parsed = await response.json()
+        if isinstance(parsed, dict):
+            return _coerce_uber_json_body(parsed)
+        return parsed
+
+    # Fallback: httpx with session file cookies (non-CDP headed-browser path).
     cookies = _build_cookies()
     if not cookies:
         return {"error": "No session found. Use uber_eats_login first."}
 
-    full_url = f"{BASE_URL.rstrip('/')}{path}" if path.startswith("/") else f"{BASE_URL.rstrip('/')}/{path}"
     async with httpx.AsyncClient(
         base_url=BASE_URL,
         headers=_api_headers(),
@@ -266,7 +327,45 @@ async def _post(path: str, body: dict | None = None) -> dict[str, Any]:
 
 
 async def _post_absolute_url(url: str, body: dict | None = None) -> dict[str, Any]:
-    """POST to an absolute URL (e.g. payments.ubereats.com) with the same session cookies."""
+    """POST to an absolute URL (e.g. payments.ubereats.com).
+
+    When CDP is enabled, routes through Chrome's page.request.post(). Note: under
+    Chrome's page.request, real cookie scoping applies — only cookies whose domain
+    matches the target host are sent. If auth cookies are host-scoped to
+    www.ubereats.com instead of .ubereats.com, payments calls could 401; the
+    fallback would be page.evaluate(fetch) against the payments origin.
+    Falls back to httpx when CDP is not configured.
+    """
+    if cdp_enabled():
+        page = await browser_manager.ensure_cdp_page()
+
+        # Read CSRF from live Chrome cookie jar.
+        csrf = await _read_csrf_from_browser()
+
+        headers = _api_headers(csrf=csrf)
+        headers["origin"] = BASE_URL
+        headers["referer"] = web_home_url()
+
+        response = await page.request.post(
+            url,
+            headers=headers,
+            data=body or {},
+        )
+
+        _append_mcp_api_call_log(full_url=url, status_code=response.status)
+
+        if response.status in (401, 403):
+            return {"error": "Session expired or invalid. Use uber_eats_login to re-authenticate."}
+        if response.status != 200:
+            text = await response.text()
+            return {"error": f"API returned {response.status}: {text[:200]}"}
+
+        parsed = await response.json()
+        if isinstance(parsed, dict):
+            return _coerce_uber_json_body(parsed)
+        return parsed
+
+    # Fallback: httpx with session file cookies (non-CDP headed-browser path).
     cookies = _build_cookies()
     if not cookies:
         return {"error": "No session found. Use uber_eats_login first."}
@@ -1022,7 +1121,7 @@ async def set_location(
     return await _post("/_p/api/setTargetLocationV1", body)
 
 
-# ── Locale + _p/api helpers (discovery uses ?localeCode=cl-en) ───────────────
+# ── Locale + _p/api helpers (discovery uses ?localeCode=us-en) ───────────────
 
 
 def _locale_query() -> str:
@@ -1035,7 +1134,7 @@ def _locale_query() -> str:
             return f"?localeCode={loc.strip()}"
     except Exception:
         pass
-    return "?localeCode=cl-en"
+    return "?localeCode=us-en"
 
 
 async def _post_with_locale(path: str, body: dict | None = None) -> dict[str, Any]:

@@ -26,7 +26,7 @@ from playwright.async_api import Page, TimeoutError as PwTimeout
 from . import api
 from . import cart_api
 from . import preferences
-from .browser import UberEatsConfig, manager
+from .browser import UberEatsConfig, manager, cdp_enabled
 from .urls import web_home_url, web_locale_path
 
 TIMEOUT = 12_000
@@ -268,11 +268,119 @@ async def _login_page_wait(page: Page, ms: int, *, trace_label: str = "") -> boo
 
 
 async def _login_session_valid_probe() -> bool:
-    """True if ~/.ubereats-session.json authenticates a lightweight Uber API call."""
+    """True if the session authenticates a lightweight Uber API call.
+
+    When CDP is enabled, uses Chrome's live cookie jar directly. Otherwise
+    falls back to the disk session file + httpx probe.
+    """
+    if cdp_enabled():
+        try:
+            raw = await api.get_saved_addresses()
+            return "error" not in raw
+        except Exception:
+            return False
     if not api.SESSION_PATH.exists():
         return False
     raw = await api.get_saved_addresses()
     return "error" not in raw
+
+
+async def _login_cdp() -> dict[str, Any]:
+    """CDP login path: connect to an existing Chrome instance and navigate to login.
+
+    Chrome must be running headed (not --headless=new) so the user can interact
+    with login forms, 2FA prompts, and captcha challenges. After login completes,
+    the session lives in Chrome's cookie jar.
+
+    If a session file exists, it's loaded into the CDP context first (cookie import).
+    """
+    if not cdp_enabled():
+        return {
+            "status": "error",
+            "message": "UBEREATS_CDP_PORT is not set. Start Chrome with --remote-debugging-port=9222 and set UBEREATS_CDP_PORT=9222.",
+            "assistant_hint": "Or omit UBEREATS_CDP_PORT to use the standalone headed-browser login flow.",
+        }
+
+    # If a session file exists, load cookies into the CDP context first.
+    if api.SESSION_PATH.exists():
+        load_msg = await manager.load_session_into_cdp()
+    else:
+        load_msg = "No session file to import."
+
+    try:
+        page = await manager.ensure_cdp_page()
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": f"Could not connect to Chrome via CDP: {exc}",
+            "assistant_hint": "Ensure Chrome is running with --remote-debugging-port matching UBEREATS_CDP_PORT.",
+        }
+
+    target = web_home_url()
+    try:
+        await page.goto(target, wait_until="domcontentloaded")
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": f"Could not navigate to {target}: {exc}",
+        }
+
+    # Try clicking sign-in link if present.
+    sign_in = page.get_by_role("link", name=re.compile(r"sign\s*in|log\s*in|iniciar", re.I))
+    try:
+        await sign_in.first.click(timeout=5000)
+    except Exception:
+        pass
+
+    print(
+        "\n>>> Chrome opened via CDP. Please log in to Uber Eats in the Chrome window.\n"
+        ">>> The session will persist in Chrome's cookie jar after login.\n",
+        file=sys.stderr,
+    )
+
+    # Wait for login — poll for auth signals.
+    logged_in = False
+    timeout_ms = 3 * 60 * 1000
+    start = asyncio.get_event_loop().time()
+
+    while not logged_in and (asyncio.get_event_loop().time() - start) * 1000 < timeout_ms:
+        await _login_page_wait(page, 1500, trace_label="cdp_poll")
+        try:
+            await _sync_session_hints_from_browser(page)
+            has_auth = _has_auth_signals()
+            url = page.url
+            on_ubereats = "ubereats.com" in url
+            if has_auth and on_ubereats:
+                logged_in = True
+                break
+        except Exception:
+            pass
+
+    # Save session to disk for backwards compat (config file, not for auth).
+    if logged_in:
+        try:
+            await manager.save_session()
+        except Exception:
+            pass
+
+    if not logged_in:
+        return {
+            "status": "timeout",
+            "message": "Login timed out after 3 minutes. Try again.",
+            "loaded_cookies": load_msg,
+        }
+
+    cfg = manager.config
+    return {
+        "status": "success",
+        "message": "Logged in via CDP. Session is in Chrome's cookie jar.",
+        "loaded_cookies": load_msg,
+        "user": {
+            "name": cfg.user_name or "(will show after your next browse or order)",
+            "email": cfg.user_email or "(will show after your next browse or order)",
+            "user_id": cfg.user_id or "(will show after your next browse or order)",
+        },
+    }
 
 
 async def login(*, force: bool = False) -> dict[str, Any]:
@@ -324,6 +432,11 @@ async def login(*, force: bool = False) -> dict[str, Any]:
                 "uber_eats_saved_addresses before login. Use force=true only to re-authenticate."
             ),
         }
+
+    # CDP path: connect to a persistent Chrome instance instead of launching a standalone browser.
+    if cdp_enabled():
+        _login_trace("login_cdp_path")
+        return await _login_cdp()
 
     async with manager.exclusive_browser_session():
         try:
@@ -877,102 +990,6 @@ async def _get_menu_item_detail_for_cart(
     return attempts[0] if attempts else {"error": "Failed to load item detail."}
 
 
-async def _create_draft_order_via_browser(create_body: dict[str, Any]) -> dict[str, Any]:
-    """
-    createDraftOrderV2 via Playwright's real browser session.
-
-    Uber's anti-bot protection blocks this mutation when sent from httpx (401).
-    The browser succeeds because it carries the full live cookie jar.
-    We navigate to ubereats.com if not already there, then use page.evaluate
-    to make the same fetch call the browser would make natively.
-    """
-    try:
-        page = await manager.ensure_interactive_page()
-        if "ubereats.com" not in (page.url or ""):
-            await page.goto("https://www.ubereats.com/", wait_until="domcontentloaded")
-            await page.wait_for_timeout(2000)
-
-        result = await page.evaluate("""async (body) => {
-            try {
-                const resp = await fetch('/_p/api/createDraftOrderV2?localeCode=cl-en', {
-                    method: 'POST',
-                    headers: {'content-type': 'application/json', 'x-csrf-token': 'x'},
-                    body: JSON.stringify(body)
-                });
-                return await resp.json();
-            } catch (e) {
-                return {status: 'failure', data: {message: String(e), code: 'FETCH_ERROR'}};
-            }
-        }""", create_body)
-        return api._coerce_uber_json_body(result) if isinstance(result, dict) else {"error": "Unexpected browser response"}
-    except Exception as exc:
-        return {"error": f"Browser createDraftOrder failed: {exc}"}
-
-
-async def _add_to_cart_browser_fallback(
-    item_name: str,
-    quantity: int = 1,
-    restaurant_url: str | None = None,
-) -> dict[str, Any]:
-    """Legacy: DOM add-to-cart. Only used when UBEREATS_CART_BROWSER_FALLBACK=1."""
-    page = await manager.ensure_interactive_page()
-
-    if restaurant_url:
-        if not restaurant_url.startswith("http"):
-            restaurant_url = f"{web_home_url().rstrip('/')}/store/{restaurant_url}"
-        if "/store/" not in page.url or restaurant_url.split("/store/")[-1] not in page.url:
-            await page.goto(restaurant_url, wait_until="domcontentloaded")
-            await page.wait_for_timeout(3000)
-
-    item_link = page.get_by_text(re.compile(re.escape(item_name), re.I)).first
-    try:
-        await item_link.click(timeout=TIMEOUT)
-    except PwTimeout:
-        return {"error": f"Could not find item '{item_name}' on the page."}
-
-    await page.wait_for_timeout(2000)
-
-    if quantity > 1:
-        increase_btn = page.locator(
-            '[data-testid*="increase"], [aria-label*="increase"], button:has-text("+")'
-        )
-        for _ in range(quantity - 1):
-            try:
-                await increase_btn.first.click(timeout=3000)
-                await page.wait_for_timeout(300)
-            except Exception:
-                break
-
-    add_btn = page.get_by_role("button", name=re.compile(
-        r"add to (cart|order)|add \d|agregar|añadir", re.I
-    ))
-    try:
-        await add_btn.first.click(timeout=TIMEOUT)
-    except PwTimeout:
-        add_btn = page.locator("button").filter(
-            has_text=re.compile(r"add|agregar|añadir", re.I)
-        )
-        try:
-            await add_btn.first.click(timeout=5000)
-        except PwTimeout:
-            return {
-                "error": (
-                    f"Found '{item_name}' but could not click 'Add to Cart'. "
-                    "The item may have required customizations — "
-                    "use uber_eats_get_item_options first."
-                ),
-            }
-
-    await page.wait_for_timeout(1500)
-    return {
-        "success": True,
-        "item": item_name,
-        "quantity": quantity,
-        "message": f"Added {item_name} x{quantity} to cart.",
-        "source": "browser",
-    }
-
-
 async def add_to_cart(
     item_name: str = "",
     quantity: int = 1,
@@ -1000,16 +1017,6 @@ async def add_to_cart(
         sec_p = ""
     name_q = (item_name or "").strip()
     explicit_ids = bool(su_p and mu_p)
-
-    # Only force browser fallback for the legacy "restaurant_url + item_name" path.
-    # If explicit UUIDs are provided, API mutations are more reliable and match discovery traffic.
-    if (
-        not explicit_ids
-        and os.environ.get("UBEREATS_CART_BROWSER_FALLBACK", "").strip() in ("1", "true", "yes")
-    ):
-        if not name_q or not restaurant_url:
-            return {"error": "Browser cart fallback requires item_name and restaurant_url."}
-        return await _add_to_cart_browser_fallback(name_q, quantity=quantity, restaurant_url=restaurant_url)
 
     if explicit_ids:
         store_raw = await api.get_store(su_p)
@@ -1245,32 +1252,12 @@ async def add_to_cart(
                         "menu_item_uuid": catalog_item.get("uuid") or "",
                     },
                 }
-        # httpx is blocked by Uber's anti-bot protection on draft creation (401).
-        # Fall back to the same call via Playwright's real browser session.
-        browser_created = await _create_draft_order_via_browser(create_body)
-        if "error" not in browser_created:
-            draft_uuid = cart_api.parse_create_draft_order_uuid(browser_created)
-            if draft_uuid:
-                return {
-                    "success": True,
-                    "item": item_label,
-                    "quantity": quantity,
-                    "message": f"Added {item_label} ×{quantity} to your cart.",
-                    "source": "api",
-                    "draft_order_uuid": draft_uuid,
-                    "ids_used": {
-                        "store_uuid": store_resolved,
-                        "section_uuid": catalog_item.get("section_uuid") or "",
-                        "subsection_uuid": catalog_item.get("subsection_uuid") or "",
-                        "menu_item_uuid": catalog_item.get("uuid") or "",
-                    },
-                }
         return {
             "error": "Couldn't start a cart for this store.",
             "assistant_hint": (
-                "createDraftOrderV2 failed via both httpx and browser. "
+                "createDraftOrderV2 failed. "
                 "Try uber_eats_login to refresh the session. "
-                f"Raw: {str(browser_created.get('error', browser_created))[:300]}"
+                f"Raw: {str(created.get('error', created))[:300]}"
             ),
         }
 
@@ -1850,29 +1837,29 @@ async def _place_order_browser() -> dict[str, Any]:
     }
 
 
-async def _place_order_via_api() -> dict[str, Any] | None:
+async def _place_order_via_api() -> dict[str, Any]:
     """POST checkoutOrdersByDraftOrdersV1 (+ optional getPreCheckoutActions)."""
     raw = await api.get_draft_orders()
     if "error" in raw:
-        return {"error": raw["error"], "try_browser": True}
+        return {"error": raw["error"]}
     orders = raw.get("data", {}).get("draftOrders") or []
     if not orders:
-        return {"error": "No draft order to submit.", "try_browser": True}
+        return {"error": "No draft order to submit."}
     du = orders[0].get("uuid") or ""
     if not du:
-        return {"error": "Draft order missing uuid.", "try_browser": True}
+        return {"error": "Draft order missing uuid."}
 
     dr = await api.get_draft_order(du)
     if "error" in dr:
-        return {"error": dr["error"], "try_browser": True}
+        return {"error": dr["error"]}
     draft = dr["data"]["draftOrder"]
 
     chk = await api.get_checkout_presentation(du)
     if "error" in chk:
-        return {"error": chk["error"], "try_browser": True}
+        return {"error": chk["error"]}
     summary = api.parse_checkout_payloads(chk)
     if "error" in summary:
-        return {"error": summary["error"], "try_browser": True}
+        return {"error": summary["error"]}
 
     total_e5 = int(summary.get("total_amount_e5") or 0)
     currency = summary.get("currency") or "CLP"
@@ -1880,13 +1867,11 @@ async def _place_order_via_api() -> dict[str, Any] | None:
     if not pay:
         return {
             "error": "Choose how you want to pay first, then I can place the order.",
-            "try_browser": True,
             "assistant_hint": "No paymentProfileUUID on draft; use uber_eats_set_checkout_payment.",
         }
     if total_e5 <= 0:
         return {
             "error": "I couldn’t read the total—open checkout preview again, or we’ll finish in the browser.",
-            "try_browser": True,
             "assistant_hint": "total_amount_e5 missing from checkout presentation.",
         }
 
@@ -1907,7 +1892,7 @@ async def _place_order_via_api() -> dict[str, Any] | None:
         )
         pre = await api.get_pre_checkout_actions(pre_body)
         if "error" in pre:
-            return {"error": pre["error"], "pre_checkout": pre, "try_browser": True}
+            return {"error": pre["error"], "pre_checkout": pre}
 
     co_body = api.build_checkout_orders_request(
         draft,
@@ -1918,7 +1903,6 @@ async def _place_order_via_api() -> dict[str, Any] | None:
     if "error" in out:
         return {
             "error": out["error"],
-            "try_browser": True,
             "checkout_submit_response": out,
         }
 
@@ -1933,26 +1917,20 @@ async def _place_order_via_api() -> dict[str, Any] | None:
 
 async def place_order() -> dict[str, Any]:
     """
-    Place the order: tries API (checkoutOrdersByDraftOrdersV1) first, then browser click.
-    Set UBEREATS_PLACE_ORDER_BROWSER_ONLY=1 to skip API. Set UBEREATS_PLACE_ORDER_NO_BROWSER_FALLBACK=1
-    to return API errors without opening the browser.
+    Place the order via the API path (checkoutOrdersByDraftOrdersV1).
+
+    All API calls now route through Chrome via CDP, so the DOM-click fallback
+    is no longer needed by default. Set UBEREATS_PLACE_ORDER_BROWSER_ONLY=1
+    to force the browser-click path in emergencies.
     """
     browser_only = os.environ.get("UBEREATS_PLACE_ORDER_BROWSER_ONLY", "").strip().lower() in (
         "1", "true", "yes",
     )
-    no_fallback = os.environ.get("UBEREATS_PLACE_ORDER_NO_BROWSER_FALLBACK", "").strip().lower() in (
-        "1", "true", "yes",
-    )
 
-    if not browser_only:
-        api_res = await _place_order_via_api()
-        if api_res and "error" not in api_res:
-            return api_res
-        if api_res and "error" in api_res and no_fallback:
-            api_res["source"] = "api"
-            return api_res
+    if browser_only:
+        return await _place_order_browser()
 
-    return await _place_order_browser()
+    return await _place_order_via_api()
 
 
 # ── Orders (API) ─────────────────────────────────────────────────────────────
