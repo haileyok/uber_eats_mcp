@@ -552,3 +552,78 @@ def summarize_customizations_for_options(menu_item_v1: dict[str, Any]) -> list[d
 
     walk(data)
     return groups[:30]
+
+
+def build_customizations_from_selections(
+    menu_item_v1: dict[str, Any],
+    selections: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the ``customizations`` dict for a cart line from agent-friendly selections.
+
+    *selections* maps group UUID → option UUID (single) or list of option UUIDs (multi-select).
+    The function walks ``data.customizationsList`` from the getMenuItemV1 response to find
+    the matching groups and options, then builds the nested dict structure Uber expects.
+
+    If a group is required (minPermitted >= 1) but not in selections, the default options
+    from the API response are kept. If selections is empty, returns {} (use API defaults).
+    """
+    if not selections:
+        return {}
+
+    if "error" in menu_item_v1:
+        return {}
+
+    data = menu_item_v1.get("data") or menu_item_v1
+    raw_list = data.get("customizationsList")
+    if not isinstance(raw_list, list):
+        return {}
+
+    out: dict[str, Any] = {}
+
+    for g in raw_list:
+        if not isinstance(g, dict):
+            continue
+        group_uuid = str(g.get("uuid") or "")
+        if not group_uuid:
+            continue
+
+        opts_in = g.get("options") or g.get("customizationOptions") or []
+        if not isinstance(opts_in, list):
+            opts_in = []
+
+        # Determine which option UUIDs the user selected for this group.
+        selected_raw = selections.get(group_uuid)
+        if selected_raw is None:
+            # Not in selections — check if it's required; keep defaults if so.
+            min_p = int(g.get("minPermitted") or 0)
+            if min_p >= 1:
+                # Keep default-selected options from the API.
+                default_opts = []
+                for o in opts_in:
+                    if isinstance(o, dict) and int(o.get("defaultQuantity") or 0) > 0:
+                        default_opts.append(str(o.get("uuid") or ""))
+                if default_opts:
+                    out[group_uuid] = default_opts
+            continue
+
+        # Normalize to a list of option UUIDs.
+        if isinstance(selected_raw, str):
+            selected_uuids = [selected_raw]
+        elif isinstance(selected_raw, list):
+            selected_uuids = [str(s) for s in selected_raw]
+        else:
+            continue
+
+        # Validate that the selected UUIDs exist in this group's options.
+        valid_uuids: list[str] = []
+        for o in opts_in:
+            if not isinstance(o, dict):
+                continue
+            opt_uuid = str(o.get("uuid") or "")
+            if opt_uuid and opt_uuid in selected_uuids:
+                valid_uuids.append(opt_uuid)
+
+        if valid_uuids:
+            out[group_uuid] = valid_uuids
+
+    return out

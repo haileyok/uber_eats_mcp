@@ -265,6 +265,7 @@ async def uber_eats_add_to_cart(
     section_uuid: str = "",
     subsection_uuid: str = "",
     menu_item_uuid: str = "",
+    customizations: str = "",
 ) -> str:
     """
     Add a line via addItemsToDraftOrderV2 + getMenuItemV1 (same stack for restaurants and grocery).
@@ -277,7 +278,10 @@ async def uber_eats_add_to_cart(
 
     Fallback: restaurant_url + item_name (fuzzy match on full menu; more error-prone).
 
-    If the item has required customizations, call uber_eats_get_item_options first.
+    If the item has required customizations, call uber_eats_get_item_options first. Then pass
+    the user's selections as a JSON string in `customizations`, mapping group_uuid → option_uuid
+    (single) or group_uuid → [option_uuid, ...] (multi-select). Example:
+    {"abc-123": "opt-456", "def-789": ["opt-a", "opt-b"]}
 
     Args:
         item_name: Display / fuzzy name (optional if UUID path fills title from getMenuItemV1)
@@ -287,7 +291,20 @@ async def uber_eats_add_to_cart(
         section_uuid: Catalog section UUID (never the same as store_uuid; optional if resolvable from menu)
         subsection_uuid: Submenu UUID (often empty; server retries with menu_item_uuid if needed)
         menu_item_uuid: SKU / catalog item UUID
+        customizations: JSON string mapping group_uuid → option_uuid(s) from uber_eats_get_item_options
     """
+    # Parse customizations JSON if provided.
+    cust_selections: dict[str, Any] | None = None
+    if customizations and customizations.strip():
+        try:
+            parsed = json.loads(customizations)
+            if isinstance(parsed, dict):
+                cust_selections = parsed
+            else:
+                return json.dumps({"error": "customizations must be a JSON object mapping group_uuid to option_uuid(s)."}, indent=2)
+        except json.JSONDecodeError as e:
+            return json.dumps({"error": f"Invalid customizations JSON: {e}"}, indent=2)
+
     result = await ubereats.add_to_cart(
         item_name=item_name,
         quantity=quantity,
@@ -296,6 +313,7 @@ async def uber_eats_add_to_cart(
         section_uuid=section_uuid,
         subsection_uuid=subsection_uuid,
         menu_item_uuid=menu_item_uuid,
+        customizations=cust_selections,
     )
     return json.dumps(result, indent=2, ensure_ascii=False)
 

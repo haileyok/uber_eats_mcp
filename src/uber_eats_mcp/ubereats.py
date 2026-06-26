@@ -1001,6 +1001,7 @@ async def add_to_cart(
     section_uuid: str = "",
     subsection_uuid: str = "",
     menu_item_uuid: str = "",
+    customizations: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Add a line via addItemsToDraftOrderV2 + getMenuItemV1 (no browser by default).
@@ -1011,6 +1012,9 @@ async def add_to_cart(
     Optional: section_uuid, subsection_uuid, item_name from search or restaurant_menu.
 
     Legacy path: restaurant_url + item_name (fuzzy match on the full menu).
+
+    If the item has customizations, pass a dict mapping group_uuid → option_uuid (or list of
+    option_uuids for multi-select). Call uber_eats_get_item_options first to see available groups.
     """
     su_p = (store_uuid or "").strip()
     sec_p = (section_uuid or "").strip()
@@ -1222,6 +1226,13 @@ async def add_to_cart(
             "subsectionUuid": catalog_item.get("subsection_uuid") or "",
             "title": catalog_item.get("name") or item_label,
         }
+
+    # Apply user-selected customizations (overrides defaults from the template).
+    if customizations:
+        cust = cart_api.build_customizations_from_selections(detail, customizations)
+        if cust:
+            line["customizations"] = cust
+
     drafts_raw = await api.get_draft_orders()
     if "error" in drafts_raw:
         return drafts_raw
