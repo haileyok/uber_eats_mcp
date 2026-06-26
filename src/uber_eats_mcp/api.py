@@ -41,6 +41,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -279,7 +280,6 @@ async def _post(path: str, body: dict | None = None) -> dict[str, Any]:
         current_url = page.url or ""
         _needs_nav = "ubereats.com" not in current_url or "__cf_chl" in current_url
         if _needs_nav:
-            import sys
             print(f"[uber-eats-mcp] navigating to ubereats.com (was: {current_url[:80]})", file=sys.stderr)
             await page.goto(web_home_url(), wait_until="domcontentloaded")
             # Wait for any Cloudflare challenge to resolve.
