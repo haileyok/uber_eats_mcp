@@ -395,11 +395,38 @@ class BrowserManager:
     # ------------------------------------------------------------------
 
     async def keepalive(self) -> str:
-        """Navigate to ubereats.com to refresh sliding session cookies."""
+        """Refresh sliding session cookies by making an API call through Chrome.
+
+        Navigates to ubereats.com (for same-origin) then calls getFeedV1 — a
+        lightweight endpoint that triggers Uber's backend to send fresh
+        set-cookie headers. Chrome processes these automatically, keeping the
+        session alive without any manual re-export.
+        """
         try:
             page = await self.ensure_cdp_page()
-            await page.goto(web_home_url(), wait_until="domcontentloaded")
-            return "Keepalive: navigated to ubereats.com."
+            current_url = page.url or ""
+            if "ubereats.com" not in current_url or "__cf_chl" in current_url:
+                await page.goto(web_home_url(), wait_until="domcontentloaded")
+                await page.wait_for_timeout(3000)
+
+            result = await page.evaluate(
+                """async () => {
+                    try {
+                        const resp = await fetch('/_p/api/getFeedV1?localeCode=us-en', {
+                            method: 'POST',
+                            headers: {'content-type': 'application/json', 'x-csrf-token': 'x'},
+                            body: JSON.stringify({}),
+                        });
+                        return { status: resp.status };
+                    } catch(e) {
+                        return { status: 0, error: String(e) };
+                    }
+                }"""
+            )
+            status = result.get("status", 0) if isinstance(result, dict) else 0
+            if status == 200:
+                return "Keepalive: session refreshed (getFeedV1 returned 200)."
+            return f"Keepalive: getFeedV1 returned {status}."
         except Exception as exc:
             return f"Keepalive failed: {exc}"
 
