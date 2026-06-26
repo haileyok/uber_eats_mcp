@@ -274,8 +274,13 @@ async def _post(path: str, body: dict | None = None) -> dict[str, Any]:
         page = await browser_manager.ensure_cdp_page()
 
         # Ensure the page is on ubereats.com so fetch() uses the right origin + cookies.
-        if "ubereats.com" not in (page.url or ""):
+        # Without this, fetch() from chrome://new-tab-page/ is cross-origin and cookies
+        # are not sent, causing 401s.
+        current_url = page.url or ""
+        if "ubereats.com" not in current_url:
             await page.goto(web_home_url(), wait_until="domcontentloaded")
+            # Wait briefly for any Cloudflare challenge to resolve.
+            await page.wait_for_timeout(2000)
 
         # Read CSRF from live Chrome cookie jar.
         csrf = await _read_csrf_from_browser()
@@ -363,8 +368,10 @@ async def _post_absolute_url(url: str, body: dict | None = None) -> dict[str, An
         page = await browser_manager.ensure_cdp_page()
 
         # Ensure the page is on ubereats.com so fetch() carries the right cookies.
-        if "ubereats.com" not in (page.url or ""):
+        current_url = page.url or ""
+        if "ubereats.com" not in current_url:
             await page.goto(web_home_url(), wait_until="domcontentloaded")
+            await page.wait_for_timeout(2000)
 
         # Read CSRF from live Chrome cookie jar.
         csrf = await _read_csrf_from_browser()
