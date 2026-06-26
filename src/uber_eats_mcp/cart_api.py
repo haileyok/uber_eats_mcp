@@ -565,7 +565,7 @@ def build_customizations_from_selections(
     the matching groups and options, then builds the nested dict structure Uber expects.
 
     The cart body customizations format is:
-    ``{ group_uuid: { option_uuid: { "quantity": N, "price": P } } }``
+    ``{ group_uuid: [ { "uuid": option_uuid, "quantity": N, "price": P } ] }``
 
     If a group is required (minPermitted >= 1) but not in selections, the default options
     from the API response are kept. If selections is empty, returns {} (use API defaults).
@@ -609,13 +609,14 @@ def build_customizations_from_selections(
             min_p = int(g.get("minPermitted") or 0)
             if min_p >= 1:
                 # Keep default-selected options from the API.
-                default_opts: dict[str, dict[str, Any]] = {}
+                default_opts: list[dict[str, Any]] = []
                 for opt_uuid, o in opt_lookup.items():
                     if int(o.get("defaultQuantity") or 0) > 0:
-                        default_opts[opt_uuid] = {
+                        default_opts.append({
+                            "uuid": opt_uuid,
                             "quantity": int(o.get("defaultQuantity") or 1),
                             "price": int(o.get("price") or 0),
-                        }
+                        })
                 if default_opts:
                     out[group_uuid] = default_opts
             continue
@@ -628,15 +629,16 @@ def build_customizations_from_selections(
         else:
             continue
 
-        # Build the nested dict with quantity + price for each selected option.
-        selected: dict[str, dict[str, Any]] = {}
+        # Build the list of option objects with uuid + quantity + price.
+        selected: list[dict[str, Any]] = []
         for opt_uuid in selected_uuids:
             o = opt_lookup.get(opt_uuid)
             if o:
-                selected[opt_uuid] = {
+                selected.append({
+                    "uuid": opt_uuid,
                     "quantity": 1,
                     "price": int(o.get("price") or 0),
-                }
+                })
 
         if selected:
             out[group_uuid] = selected
