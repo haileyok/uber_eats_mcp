@@ -293,14 +293,22 @@ async def _post(path: str, body: dict | None = None) -> dict[str, Any]:
         # Use page.evaluate(fetch) — this is a real browser fetch from within the
         # page's JS context. It carries Chrome's cookies, uses the page's TLS
         # fingerprint, and processes set-cookie responses automatically.
+        # CRITICAL: use a relative URL (not absolute) and minimal headers —
+        # matching what the real ubereats.com web client sends. Uber's anti-bot
+        # blocks createDraftOrderV2 when extra headers or absolute URLs are present.
+        # The page is already on ubereats.com (navigated above), so relative URLs work.
+        # Extract just the path+query from the full URL.
+        from urllib.parse import urlparse
+        parsed = urlparse(full_url)
+        relative_url = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+
         result = await page.evaluate(
-            """async ({url, body, headers}) => {
+            """async ({url, body}) => {
                 try {
                     const resp = await fetch(url, {
                         method: 'POST',
-                        headers: headers,
+                        headers: {'content-type': 'application/json', 'x-csrf-token': 'x'},
                         body: JSON.stringify(body || {}),
-                        credentials: 'include',
                     });
                     const text = await resp.text();
                     let parsed = null;
@@ -310,7 +318,7 @@ async def _post(path: str, body: dict | None = None) -> dict[str, Any]:
                     return { status: 0, body: null, text: String(e) };
                 }
             }""",
-            {"url": full_url, "body": body or {}, "headers": headers},
+            {"url": relative_url, "body": body or {}},
         )
 
         status = result.get("status", 0) if isinstance(result, dict) else 0
@@ -384,6 +392,8 @@ async def _post_absolute_url(url: str, body: dict | None = None) -> dict[str, An
         headers["origin"] = BASE_URL
         headers["referer"] = web_home_url()
 
+        # payments.ubereats.com is cross-origin from www.ubereats.com — must use
+        # absolute URL with credentials: 'include' for cookies to be sent.
         result = await page.evaluate(
             """async ({url, body, headers}) => {
                 try {
@@ -406,6 +416,7 @@ async def _post_absolute_url(url: str, body: dict | None = None) -> dict[str, An
 
         status = result.get("status", 0) if isinstance(result, dict) else 0
         _append_mcp_api_call_log(full_url=url, status_code=status)
+        print(f"[uber-eats-mcp] {url[:80]} → status={status}", file=sys.stderr)
 
         if status in (401, 403):
             return {"error": "Session expired or invalid. Use uber_eats_login to re-authenticate."}
