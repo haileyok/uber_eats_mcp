@@ -313,9 +313,9 @@ async def _post(path: str, body: dict | None = None) -> dict[str, Any]:
                     const text = await resp.text();
                     let parsed = null;
                     try { parsed = JSON.parse(text); } catch(e) {}
-                    return { status: resp.status, body: parsed, text: text.slice(0, 2000) };
+                    return { status: resp.status, body: parsed, text: text.slice(0, 500), url: url };
                 } catch(e) {
-                    return { status: 0, body: null, text: String(e) };
+                    return { status: 0, body: null, text: String(e), url: url };
                 }
             }""",
             {"url": relative_url, "body": body or {}},
@@ -323,7 +323,7 @@ async def _post(path: str, body: dict | None = None) -> dict[str, Any]:
 
         status = result.get("status", 0) if isinstance(result, dict) else 0
         _append_mcp_api_call_log(full_url=full_url, status_code=status)
-        print(f"[uber-eats-mcp] {full_url[:80]} → status={status}", file=sys.stderr)
+        print(f"[uber-eats-mcp] {relative_url[:80]} → status={status} body={str(result.get('body',''))[:120] if isinstance(result, dict) else 'N/A'}", file=sys.stderr)
 
         if status in (401, 403):
             return {"error": "Session expired or invalid. Use uber_eats_login to re-authenticate."}
