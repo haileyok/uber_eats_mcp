@@ -262,39 +262,60 @@ async def _read_csrf_from_browser() -> str:
 async def _post(path: str, body: dict | None = None) -> dict[str, Any]:
     """Make an authenticated POST to the Uber Eats API.
 
-    When CDP is enabled, routes through Chrome's page.request.post() which uses the
-    live cookie jar automatically — set-cookie responses are processed, CSRF tokens
-    stay current, and anti-bot detection is satisfied because requests come from a
-    real browser context. Falls back to httpx when CDP is not configured.
+    When CDP is enabled, routes through Chrome via page.evaluate(fetch) — a real
+    browser fetch from within the page's JavaScript context. This satisfies Uber's
+    anti-bot detection because the request has a real browser TLS fingerprint,
+    uses the page's origin, and carries Chrome's live cookie jar automatically.
+    Falls back to httpx when CDP is not configured.
     """
     full_url = f"{BASE_URL.rstrip('/')}{path}" if path.startswith("/") else f"{BASE_URL.rstrip('/')}/{path}"
 
     if cdp_enabled():
         page = await browser_manager.ensure_cdp_page()
-        ctx = page.context
 
-        # Read CSRF from live Chrome cookie jar (not stale disk file).
+        # Ensure the page is on ubereats.com so fetch() uses the right origin + cookies.
+        if "ubereats.com" not in (page.url or ""):
+            await page.goto(web_home_url(), wait_until="domcontentloaded")
+
+        # Read CSRF from live Chrome cookie jar.
         csrf = await _read_csrf_from_browser()
+        headers = _api_headers(csrf=csrf)
 
-        # page.request uses Chrome's cookie jar automatically — no manual cookie building.
-        response = await page.request.post(
-            full_url,
-            headers=_api_headers(csrf=csrf),
-            data=body or {},  # Playwright serializes dict to JSON + sets content-type.
+        # Use page.evaluate(fetch) — this is a real browser fetch from within the
+        # page's JS context. It carries Chrome's cookies, uses the page's TLS
+        # fingerprint, and processes set-cookie responses automatically.
+        result = await page.evaluate(
+            """async ({url, body, headers}) => {
+                try {
+                    const resp = await fetch(url, {
+                        method: 'POST',
+                        headers: headers,
+                        body: JSON.stringify(body || {}),
+                        credentials: 'include',
+                    });
+                    const text = await resp.text();
+                    let parsed = null;
+                    try { parsed = JSON.parse(text); } catch(e) {}
+                    return { status: resp.status, body: parsed, text: text.slice(0, 2000) };
+                } catch(e) {
+                    return { status: 0, body: null, text: String(e) };
+                }
+            }""",
+            {"url": full_url, "body": body or {}, "headers": headers},
         )
 
-        _append_mcp_api_call_log(full_url=full_url, status_code=response.status)
+        status = result.get("status", 0) if isinstance(result, dict) else 0
+        _append_mcp_api_call_log(full_url=full_url, status_code=status)
 
-        if response.status in (401, 403):
+        if status in (401, 403):
             return {"error": "Session expired or invalid. Use uber_eats_login to re-authenticate."}
-        if response.status != 200:
-            text = await response.text()
-            return {"error": f"API returned {response.status}: {text[:200]}"}
+        if status != 200:
+            text = result.get("text", "") if isinstance(result, dict) else ""
+            return {"error": f"API returned {status}: {text[:200]}"}
 
-        try:
-            parsed = await response.json()
-        except Exception:
-            text = await response.text()
+        parsed = result.get("body") if isinstance(result, dict) else None
+        if parsed is None:
+            text = result.get("text", "") if isinstance(result, dict) else ""
             return {"error": f"Failed to parse response: {text[:200]}"}
 
         if isinstance(parsed, dict):
@@ -334,41 +355,55 @@ async def _post(path: str, body: dict | None = None) -> dict[str, Any]:
 async def _post_absolute_url(url: str, body: dict | None = None) -> dict[str, Any]:
     """POST to an absolute URL (e.g. payments.ubereats.com).
 
-    When CDP is enabled, routes through Chrome's page.request.post(). Note: under
-    Chrome's page.request, real cookie scoping applies — only cookies whose domain
-    matches the target host are sent. If auth cookies are host-scoped to
-    www.ubereats.com instead of .ubereats.com, payments calls could 401; the
-    fallback would be page.evaluate(fetch) against the payments origin.
+    When CDP is enabled, routes through Chrome via page.evaluate(fetch). Real cookie
+    scoping applies — only cookies whose domain matches the target host are sent.
     Falls back to httpx when CDP is not configured.
     """
     if cdp_enabled():
         page = await browser_manager.ensure_cdp_page()
 
+        # Ensure the page is on ubereats.com so fetch() carries the right cookies.
+        if "ubereats.com" not in (page.url or ""):
+            await page.goto(web_home_url(), wait_until="domcontentloaded")
+
         # Read CSRF from live Chrome cookie jar.
         csrf = await _read_csrf_from_browser()
-
         headers = _api_headers(csrf=csrf)
         headers["origin"] = BASE_URL
         headers["referer"] = web_home_url()
 
-        response = await page.request.post(
-            url,
-            headers=headers,
-            data=body or {},
+        result = await page.evaluate(
+            """async ({url, body, headers}) => {
+                try {
+                    const resp = await fetch(url, {
+                        method: 'POST',
+                        headers: headers,
+                        body: JSON.stringify(body || {}),
+                        credentials: 'include',
+                    });
+                    const text = await resp.text();
+                    let parsed = null;
+                    try { parsed = JSON.parse(text); } catch(e) {}
+                    return { status: resp.status, body: parsed, text: text.slice(0, 2000) };
+                } catch(e) {
+                    return { status: 0, body: null, text: String(e) };
+                }
+            }""",
+            {"url": url, "body": body or {}, "headers": headers},
         )
 
-        _append_mcp_api_call_log(full_url=url, status_code=response.status)
+        status = result.get("status", 0) if isinstance(result, dict) else 0
+        _append_mcp_api_call_log(full_url=url, status_code=status)
 
-        if response.status in (401, 403):
+        if status in (401, 403):
             return {"error": "Session expired or invalid. Use uber_eats_login to re-authenticate."}
-        if response.status != 200:
-            text = await response.text()
-            return {"error": f"API returned {response.status}: {text[:200]}"}
+        if status != 200:
+            text = result.get("text", "") if isinstance(result, dict) else ""
+            return {"error": f"API returned {status}: {text[:200]}"}
 
-        try:
-            parsed = await response.json()
-        except Exception:
-            text = await response.text()
+        parsed = result.get("body") if isinstance(result, dict) else None
+        if parsed is None:
+            text = result.get("text", "") if isinstance(result, dict) else ""
             return {"error": f"Failed to parse response: {text[:200]}"}
 
         if isinstance(parsed, dict):
