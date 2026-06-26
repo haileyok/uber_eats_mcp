@@ -277,10 +277,14 @@ async def _post(path: str, body: dict | None = None) -> dict[str, Any]:
         # Without this, fetch() from chrome://new-tab-page/ is cross-origin and cookies
         # are not sent, causing 401s.
         current_url = page.url or ""
-        if "ubereats.com" not in current_url:
+        _needs_nav = "ubereats.com" not in current_url or "__cf_chl" in current_url
+        if _needs_nav:
+            import sys
+            print(f"[uber-eats-mcp] navigating to ubereats.com (was: {current_url[:80]})", file=sys.stderr)
             await page.goto(web_home_url(), wait_until="domcontentloaded")
-            # Wait briefly for any Cloudflare challenge to resolve.
-            await page.wait_for_timeout(2000)
+            # Wait for any Cloudflare challenge to resolve.
+            await page.wait_for_timeout(3000)
+            print(f"[uber-eats-mcp] after goto: {page.url[:80]}", file=sys.stderr)
 
         # Read CSRF from live Chrome cookie jar.
         csrf = await _read_csrf_from_browser()
@@ -311,6 +315,7 @@ async def _post(path: str, body: dict | None = None) -> dict[str, Any]:
 
         status = result.get("status", 0) if isinstance(result, dict) else 0
         _append_mcp_api_call_log(full_url=full_url, status_code=status)
+        print(f"[uber-eats-mcp] {full_url[:80]} → status={status}", file=sys.stderr)
 
         if status in (401, 403):
             return {"error": "Session expired or invalid. Use uber_eats_login to re-authenticate."}
