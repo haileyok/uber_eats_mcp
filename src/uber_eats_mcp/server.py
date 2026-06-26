@@ -27,8 +27,13 @@ from .browser import manager, cdp_enabled
 
 @asynccontextmanager
 async def _lifespan(app):
-    """Start/stop the background keepalive task within the running event loop."""
+    """Start the background keepalive task and auto-load session cookies on startup."""
     if cdp_enabled():
+        # Auto-load cookies from ~/.ubereats-session.json if present (cookie import path).
+        if manager.has_session():
+            msg = await manager.load_session_into_cdp()
+            print(f"[uber-eats-mcp] {msg}", file=sys.stderr)
+        # Start the background keepalive task.
         manager.start_keepalive_task()
     try:
         yield

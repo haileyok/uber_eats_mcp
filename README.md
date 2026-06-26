@@ -88,23 +88,36 @@ Use the `uber-eats-mcp` entry point with `UBEREATS_CDP_PORT` and `UBEREATS_WEB_L
 
 ## Initial login
 
-Login is the one step that requires human interaction — Uber's flow includes 2FA, SMS codes, and captcha challenges that cannot be automated. There are two paths:
+Login is the one step that requires human interaction — Uber's flow includes 2FA, SMS codes, and captcha challenges that cannot be automated. There are several paths:
 
-### Option A: CDP login (recommended)
+### Option A: Cookie import from your laptop browser (recommended for headless)
+
+This is the cleanest path for fully headless setups. Export cookies from your laptop, convert them, and drop them on the server — no browser interaction needed.
+
+1. **Install the [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) extension** in your laptop's Chrome.
+2. **Log into Uber Eats** in your laptop browser (www.ubereats.com).
+3. **Click the extension icon** and export as **JSON** (not Netscape). You'll get a file like `ubereats.com_cookies.json`.
+4. **Copy the file to the server** running Chrome + the MCP server:
+   ```bash
+   scp ubereats.com_cookies.json hailey.coder:~/personal/uber_eats_mcp-cdp/
+   ```
+5. **Run the converter** on the server:
+   ```bash
+   cd ~/personal/uber_eats_mcp-cdp
+   python scripts/convert_cookies.py ubereats.com_cookies.json
+   ```
+   This writes `~/.ubereats-session.json` in Playwright's `storage_state` format.
+6. **Restart the MCP server** (or call `uber_eats_login`). On startup, the server auto-loads these cookies into Chrome's cookie jar via CDP.
+7. **Verify** with `uber_eats_whoami` — should show your account info.
+
+The keep-alive mechanism refreshes sliding session cookies every 4 hours, so you won't need to re-export frequently. When the session eventually expires, just repeat steps 3-6.
+
+### Option B: CDP headed login
 
 1. Start Chrome **headed** (not `--headless=new`): `./scripts/start_chrome.sh 9222 --headed`
 2. Run `uber_eats_login` — the MCP server navigates the CDP-connected Chrome to the Uber Eats login page.
 3. Log in manually in the Chrome window (handle 2FA/captcha as needed).
 4. The session persists in Chrome's cookie jar. You can restart Chrome with `--headless=new` for ongoing operation (using the same `--user-data-dir`), or keep it headed.
-
-### Option B: Cookie import (headless-only setups)
-
-1. Log into Uber Eats in your regular browser.
-2. Export the session as a Playwright `storage_state` JSON file (cookies + localStorage).
-3. Place it at `~/.ubereats-session.json`.
-4. Run `uber_eats_whoami` to verify.
-
-This requires re-exporting when the session expires, but the keep-alive mechanism makes that infrequent.
 
 ### Option C: Standalone headed browser (fallback, no CDP)
 
