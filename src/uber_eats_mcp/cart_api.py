@@ -564,6 +564,9 @@ def build_customizations_from_selections(
     The function walks ``data.customizationsList`` from the getMenuItemV1 response to find
     the matching groups and options, then builds the nested dict structure Uber expects.
 
+    The cart body customizations format is:
+    ``{ group_uuid: { option_uuid: { "quantity": N, "price": P } } }``
+
     If a group is required (minPermitted >= 1) but not in selections, the default options
     from the API response are kept. If selections is empty, returns {} (use API defaults).
     """
@@ -591,6 +594,14 @@ def build_customizations_from_selections(
         if not isinstance(opts_in, list):
             opts_in = []
 
+        # Build a lookup of option UUID → option data.
+        opt_lookup: dict[str, dict[str, Any]] = {}
+        for o in opts_in:
+            if isinstance(o, dict):
+                opt_uuid = str(o.get("uuid") or "")
+                if opt_uuid:
+                    opt_lookup[opt_uuid] = o
+
         # Determine which option UUIDs the user selected for this group.
         selected_raw = selections.get(group_uuid)
         if selected_raw is None:
@@ -598,10 +609,13 @@ def build_customizations_from_selections(
             min_p = int(g.get("minPermitted") or 0)
             if min_p >= 1:
                 # Keep default-selected options from the API.
-                default_opts = []
-                for o in opts_in:
-                    if isinstance(o, dict) and int(o.get("defaultQuantity") or 0) > 0:
-                        default_opts.append(str(o.get("uuid") or ""))
+                default_opts: dict[str, dict[str, Any]] = {}
+                for opt_uuid, o in opt_lookup.items():
+                    if int(o.get("defaultQuantity") or 0) > 0:
+                        default_opts[opt_uuid] = {
+                            "quantity": int(o.get("defaultQuantity") or 1),
+                            "price": int(o.get("price") or 0),
+                        }
                 if default_opts:
                     out[group_uuid] = default_opts
             continue
@@ -614,16 +628,17 @@ def build_customizations_from_selections(
         else:
             continue
 
-        # Validate that the selected UUIDs exist in this group's options.
-        valid_uuids: list[str] = []
-        for o in opts_in:
-            if not isinstance(o, dict):
-                continue
-            opt_uuid = str(o.get("uuid") or "")
-            if opt_uuid and opt_uuid in selected_uuids:
-                valid_uuids.append(opt_uuid)
+        # Build the nested dict with quantity + price for each selected option.
+        selected: dict[str, dict[str, Any]] = {}
+        for opt_uuid in selected_uuids:
+            o = opt_lookup.get(opt_uuid)
+            if o:
+                selected[opt_uuid] = {
+                    "quantity": 1,
+                    "price": int(o.get("price") or 0),
+                }
 
-        if valid_uuids:
-            out[group_uuid] = valid_uuids
+        if selected:
+            out[group_uuid] = selected
 
     return out
